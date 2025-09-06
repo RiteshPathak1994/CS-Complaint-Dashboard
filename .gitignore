@@ -1,5 +1,20 @@
-service_account.json 
-.env 
-*.pem 
-*.key 
-credentials.json 
+﻿# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual envs
+.venv/
+.venv_test/
+
+# Editor / OS files
+.vscode/
+.DS_Store
+
+# Secrets and environment files
+.env
+service_account.json
+
+# Misc
+$null
