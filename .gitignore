@@ -4,8 +4,10 @@ __pycache__/
 
 # Virtual envs
 .venv/
-.venv_test/
+venv/
+ENV/
+env/
 
-# Secrets
-.env
+# Secrets / local files
 service_account.json
+.env
