@@ -1,20 +1,11 @@
-﻿# Python caches
+﻿# Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
 
 # Virtual envs
 .venv/
 .venv_test/
 
-# Editor / OS files
-.vscode/
-.DS_Store
-
-# Secrets and environment files
+# Secrets
 .env
 service_account.json
-
-# Misc
-$null
