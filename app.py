@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 import smtplib
 from email.mime.text import MIMEText
@@ -33,8 +33,6 @@ COMPLAINT_TAB_NAME = "Comp"
 
 REPORTER_SHEET_URL = "https://docs.google.com/spreadsheets/d/1OJWpQOwevw1W5iNUk6dm_wfZphuBdjboCkrQwYwTNOY/edit#gid=0"
 
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "your_email@gmail.com")
-MANAGER_EMAIL = os.getenv("MANAGER_EMAIL", "manager_email@gmail.com")
 DRIVE_FOLDER_ID = "12s1H0gbboQo-Ha_d86Miack9QvX6wHde"   # complaint attachments folder
 
 # ----------------------------
@@ -43,7 +41,7 @@ DRIVE_FOLDER_ID = "12s1H0gbboQo-Ha_d86Miack9QvX6wHde"   # complaint attachments 
 load_dotenv()
 
 # ----------------------------
-# Minimal logger for auth-related info (streamlit logs)
+# Logging for debugging
 # ----------------------------
 logger = logging.getLogger("cs_complaint_auth")
 if not logger.handlers:
@@ -53,163 +51,201 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 # ----------------------------
-# Helper to convert table-style secret to service-account-info dict
+# Helper utilities for secrets
 # ----------------------------
-def _secrets_table_to_info(table):
+def _fix_private_key_str(s):
+    """Fix common private_key formatting issues (escaped \n)."""
+    if not s or not isinstance(s, str):
+        return s
+    s = s.strip()
+    # Remove surrounding triple-quotes if present
+    if (s.startswith('"""') and s.endswith('"""')) or (s.startswith("'''") and s.endswith("'''")):
+        s = s[3:-3]
+    # replace escaped newlines with real newlines
+    if "\\n" in s and "-----BEGIN" in s:
+        s = s.replace("\\n", "\n")
+    return s
+
+def _normalize_service_account_info(info):
     """
-    Convert a Streamlit TOML table (st.secrets['GCP_SERVICE_ACCOUNT']) to the
-    dict expected by google.oauth2.service_account.Credentials.from_service_account_info.
+    Ensure info is a dict, and fix private_key format if present.
     """
-    info = {}
-    # copy keys directly; private_key should be a single multiline string already
-    for k, v in table.items():
-        info[k] = v
+    if not isinstance(info, dict):
+        return info
+    info = dict(info)  # shallow copy
+    if "private_key" in info and info["private_key"]:
+        info["private_key"] = _fix_private_key_str(info["private_key"])
     return info
 
-# ----------------------------
-# AUTH (robust: supports st.secrets table, st.secrets JSON, env JSON, GOOGLE_APPLICATION_CREDENTIALS, local file)
-# ----------------------------
-@st.cache_resource
-def get_gspread_client():
+def _secrets_table_to_info(table):
     """
-    Create and return a gspread client using credentials resolved from (in order):
-      1) st.secrets["GCP_SERVICE_ACCOUNT_JSON"] (full JSON string)
-      2) st.secrets["GCP_SERVICE_ACCOUNT"] (table-style: keys of the JSON)
-      3) env var GCP_SERVICE_ACCOUNT_JSON (full JSON string)
-      4) GOOGLE_APPLICATION_CREDENTIALS path
-      5) local service_account.json file
+    Convert TOML table from st.secrets (GCP_SERVICE_ACCOUNT) into a dict suitable
+    for Credentials.from_service_account_info.
     """
-    scope = ["https://www.googleapis.com/auth/spreadsheets",
-             "https://www.googleapis.com/auth/drive"]
+    if not isinstance(table, dict):
+        return table
+    info = {}
+    for k, v in table.items():
+        info[k] = v
+    # fix private_key formatting just in case
+    return _normalize_service_account_info(info)
 
-    # 1) Streamlit secrets: JSON string
+# ----------------------------
+# Read admin & email config from secrets/env
+# ----------------------------
+def _secret_or_env(key, default=None):
+    if isinstance(st.secrets, dict) and key in st.secrets:
+        return st.secrets.get(key)
+    return os.environ.get(key, default)
+
+ADMIN_EMAIL = _secret_or_env("ADMIN_EMAIL", os.environ.get("ADMIN_EMAIL", "your_email@gmail.com"))
+MANAGER_EMAIL = _secret_or_env("MANAGER_EMAIL", os.environ.get("MANAGER_EMAIL", "manager_email@gmail.com"))
+EMAIL_USER = _secret_or_env("EMAIL_USER", os.environ.get("EMAIL_USER"))
+EMAIL_PASS = _secret_or_env("EMAIL_PASS", os.environ.get("EMAIL_PASS"))
+
+# ----------------------------
+# AUTH functions (robust)
+# ----------------------------
+def _resolve_service_account_info_from_secrets():
+    """
+    Try multiple sources and return a credentials-info dict if found, else None.
+    Sources (in order):
+      - st.secrets["GCP_SERVICE_ACCOUNT_JSON"] (string containing JSON)
+      - st.secrets["GCP_SERVICE_ACCOUNT"] (TOML table)
+      - env var GCP_SERVICE_ACCOUNT_JSON (string containing JSON)
+      - env var GOOGLE_APPLICATION_CREDENTIALS (path) -> handled elsewhere
+      - local file service_account.json -> handled elsewhere
+    """
+    # 1) st.secrets JSON string
     try:
         if isinstance(st.secrets, dict) and "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
             raw = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
             logger.info("Auth: using st.secrets['GCP_SERVICE_ACCOUNT_JSON']")
             info = json.loads(raw) if isinstance(raw, str) else raw
-            creds = Credentials.from_service_account_info(info, scopes=scope)
-            return gspread.authorize(creds)
+            return _normalize_service_account_info(info)
     except Exception as e:
-        logger.warning(f"Auth (st.secrets JSON) failed: {e}")
+        logger.warning(f"Auth (st.secrets JSON) parse failed: {e}")
 
-    # 2) Streamlit secrets: table-style (TOML)
+    # 2) st.secrets TOML table
     try:
         if isinstance(st.secrets, dict) and "GCP_SERVICE_ACCOUNT" in st.secrets:
             table = st.secrets["GCP_SERVICE_ACCOUNT"]
             logger.info("Auth: using st.secrets['GCP_SERVICE_ACCOUNT'] table")
             info = _secrets_table_to_info(table)
-            creds = Credentials.from_service_account_info(info, scopes=scope)
-            return gspread.authorize(creds)
+            return info
     except Exception as e:
-        logger.warning(f"Auth (st.secrets table) failed: {e}")
+        logger.warning(f"Auth (st.secrets table) parse failed: {e}")
 
-    # 3) Environment variable with JSON content
+    # 3) env var JSON
     env_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
     if env_json:
         try:
-            logger.info("Auth: using GCP_SERVICE_ACCOUNT_JSON from environment variable")
+            logger.info("Auth: using environment GCP_SERVICE_ACCOUNT_JSON")
             info = json.loads(env_json)
-            creds = Credentials.from_service_account_info(info, scopes=scope)
+            return _normalize_service_account_info(info)
+        except Exception as e:
+            logger.warning(f"Auth (env JSON) parse failed: {e}")
+
+    return None
+
+@st.cache_resource
+def _create_creds_from_info(info, scopes):
+    """Wrap Credentials.from_service_account_info with normalization."""
+    info = _normalize_service_account_info(info)
+    return Credentials.from_service_account_info(info, scopes=scopes)
+
+def get_gspread_client_try():
+    """
+    Attempt to create a gspread client. Returns client if successful, else raises.
+    """
+    scope = ["https://www.googleapis.com/auth/spreadsheets",
+             "https://www.googleapis.com/auth/drive"]
+
+    # 1) Try st.secrets / env JSON path
+    info = _resolve_service_account_info_from_secrets()
+    if info:
+        try:
+            creds = _create_creds_from_info(info, scopes=scope)
+            logger.info("Auth success using in-memory service account info")
             return gspread.authorize(creds)
         except Exception as e:
-            logger.warning(f"Auth (env JSON) failed: {e}")
+            logger.warning(f"Auth using in-memory info failed: {e}")
 
-    # 4) GOOGLE_APPLICATION_CREDENTIALS path (standard)
+    # 2) GOOGLE_APPLICATION_CREDENTIALS path
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_path:
         try:
             if os.path.exists(creds_path):
-                logger.info(f"Auth: using service account file from GOOGLE_APPLICATION_CREDENTIALS: {creds_path}")
                 creds = Credentials.from_service_account_file(creds_path, scopes=scope)
+                logger.info("Auth success using GOOGLE_APPLICATION_CREDENTIALS file")
                 return gspread.authorize(creds)
             else:
-                logger.warning(f"GOOGLE_APPLICATION_CREDENTIALS is set but file not found: {creds_path}")
+                logger.warning(f"GOOGLE_APPLICATION_CREDENTIALS set but file not found: {creds_path}")
         except Exception as e:
             logger.warning(f"Auth (GOOGLE_APPLICATION_CREDENTIALS) failed: {e}")
 
-    # 5) Local service_account.json (last resort)
+    # 3) local file
     local_path = "service_account.json"
     if os.path.exists(local_path):
         try:
-            logger.info("Auth: using local service_account.json")
             creds = Credentials.from_service_account_file(local_path, scopes=scope)
+            logger.info("Auth success using local service_account.json")
             return gspread.authorize(creds)
         except Exception as e:
-            logger.warning(f"Auth (local file) failed: {e}")
+            logger.warning(f"Auth (local service_account.json) failed: {e}")
 
-    # Nothing worked — raise informative error so user sees it in logs/UI
+    # If nothing worked, raise with guidance
     raise RuntimeError(
         "Google service account credentials not found. Provide credentials by one of the following:\n"
-        "1) On Streamlit Cloud: Manage app → Secrets → add GCP_SERVICE_ACCOUNT (table) or GCP_SERVICE_ACCOUNT_JSON (full JSON string).\n"
+        "1) On Streamlit Cloud: Manage app → Secrets → add GCP_SERVICE_ACCOUNT (table) OR GCP_SERVICE_ACCOUNT_JSON (full JSON string).\n"
+        "   - For table-style, keys must match the JSON key names (type, project_id, private_key_id, private_key, client_email, client_id, auth_uri, token_uri, auth_provider_x509_cert_url, client_x509_cert_url, etc.).\n"
         "2) Set environment variable GCP_SERVICE_ACCOUNT_JSON to the full JSON content.\n"
         "3) Set GOOGLE_APPLICATION_CREDENTIALS to the path to a key file on the server.\n"
         "4) Place service_account.json in the app folder (not recommended for public repos).\n"
     )
 
-def get_drive_service():
+def get_drive_service_try():
     """
-    Build a Drive v3 service using the same credential resolution as get_gspread_client.
+    Attempt to create a Drive v3 service.
     """
     scope = ["https://www.googleapis.com/auth/drive"]
 
-    # 1) st.secrets JSON
-    try:
-        if isinstance(st.secrets, dict) and "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
-            raw = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
-            info = json.loads(raw) if isinstance(raw, str) else raw
-            creds = Credentials.from_service_account_info(info, scopes=scope)
-            logger.info("Drive auth: using st.secrets['GCP_SERVICE_ACCOUNT_JSON']")
-            return build("drive", "v3", credentials=creds)
-    except Exception as e:
-        logger.warning(f"Drive auth (st.secrets JSON) failed: {e}")
-
-    # 2) st.secrets table
-    try:
-        if isinstance(st.secrets, dict) and "GCP_SERVICE_ACCOUNT" in st.secrets:
-            table = st.secrets["GCP_SERVICE_ACCOUNT"]
-            info = _secrets_table_to_info(table)
-            creds = Credentials.from_service_account_info(info, scopes=scope)
-            logger.info("Drive auth: using st.secrets['GCP_SERVICE_ACCOUNT'] table")
-            return build("drive", "v3", credentials=creds)
-    except Exception as e:
-        logger.warning(f"Drive auth (st.secrets table) failed: {e}")
-
-    # 3) env JSON
-    env_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
-    if env_json:
+    info = _resolve_service_account_info_from_secrets()
+    if info:
         try:
-            info = json.loads(env_json)
-            creds = Credentials.from_service_account_info(info, scopes=scope)
-            logger.info("Drive auth: using env GCP_SERVICE_ACCOUNT_JSON")
+            creds = _create_creds_from_info(info, scopes=scope)
+            logger.info("Drive auth success using in-memory info")
             return build("drive", "v3", credentials=creds)
         except Exception as e:
-            logger.warning(f"Drive auth (env JSON) failed: {e}")
+            logger.warning(f"Drive auth using in-memory info failed: {e}")
 
-    # 4) GOOGLE_APPLICATION_CREDENTIALS
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_path and os.path.exists(creds_path):
         try:
             creds = Credentials.from_service_account_file(creds_path, scopes=scope)
-            logger.info("Drive auth: using GOOGLE_APPLICATION_CREDENTIALS file")
+            logger.info("Drive auth success using GOOGLE_APPLICATION_CREDENTIALS")
             return build("drive", "v3", credentials=creds)
         except Exception as e:
             logger.warning(f"Drive auth (GOOGLE_APPLICATION_CREDENTIALS) failed: {e}")
 
-    # 5) local file
     local_path = "service_account.json"
     if os.path.exists(local_path):
         try:
             creds = Credentials.from_service_account_file(local_path, scopes=scope)
-            logger.info("Drive auth: using local service_account.json")
+            logger.info("Drive auth success using local service_account.json")
             return build("drive", "v3", credentials=creds)
         except Exception as e:
             logger.warning(f"Drive auth (local file) failed: {e}")
 
     raise RuntimeError("Could not create Drive service because no service account credentials were found.")
 
-# create gspread client (cached)
-client = get_gspread_client()
+# Try to create client now but handle failures gracefully so app doesn't crash at import
+try:
+    client = get_gspread_client_try()
+    logger.info("gspread client created")
+except Exception as e:
+    client = None
+    logger.error(f"Could not create gspread client: {e}")
 
 # ----------------------------
 # EMAIL HELPER
@@ -221,8 +257,8 @@ def send_email_with_attachments(to_emails, subject, body, attachments=None):
     """
     if isinstance(to_emails, str):
         to_emails = [e.strip() for e in to_emails.split(",") if e.strip()]
-    sender_email = os.getenv("EMAIL_USER")
-    sender_password = os.getenv("EMAIL_PASS")
+    sender_email = EMAIL_USER or os.getenv("EMAIL_USER")
+    sender_password = EMAIL_PASS or os.getenv("EMAIL_PASS")
     if not sender_email or not sender_password:
         st.error("Email credentials not set (EMAIL_USER / EMAIL_PASS). Cannot send email.")
         return False, "Email credentials not configured"
@@ -237,7 +273,6 @@ def send_email_with_attachments(to_emails, subject, body, attachments=None):
         for att in attachments:
             filename = att.get("filename", "attachment")
             content = att.get("content", b"")
-            mimetype = att.get("mimetype", "application/octet-stream")
             part = MIMEBase("application", "octet-stream")
             part.set_payload(content)
             encoders.encode_base64(part)
@@ -252,9 +287,13 @@ def send_email_with_attachments(to_emails, subject, body, attachments=None):
         server.quit()
         return True, None
     except Exception as e:
+        logger.error(f"Email send failed: {e}")
         return False, str(e)
 
 def get_reporter_email(reporter_name):
+    if client is None:
+        logger.warning("get_reporter_email: gspread client not available")
+        return None
     try:
         reporter_ss = client.open_by_url(REPORTER_SHEET_URL)
         reporter_ws = reporter_ss.get_worksheet(0)
@@ -262,15 +301,19 @@ def get_reporter_email(reporter_name):
         for row in records:
             if str(row.get("Reporter Name", "")).strip().lower() == reporter_name.strip().lower():
                 return row.get("Email Address")
-    except Exception:
+    except Exception as e:
+        logger.warning(f"get_reporter_email failed: {e}")
         return None
     return None
 
 # ----------------------------
-# HELPERS
+# HELPERS (data)
 # ----------------------------
 @st.cache_data(ttl=300)
 def load_school_names():
+    if client is None:
+        st.warning("Google credentials not configured. School list cannot be loaded.")
+        return []
     impl_ss = client.open(IMPL_SPREADSHEET_NAME)
     impl_ws = impl_ss.worksheet(IMPL_TAB_NAME)
     values = impl_ws.get_all_values()
@@ -283,6 +326,8 @@ def load_school_names():
     return list(dict.fromkeys(schools))  # unique
 
 def append_complaint_row(row):
+    if client is None:
+        raise RuntimeError("Google credentials not configured. Cannot append complaint.")
     comp_ss = client.open(COMPLAINT_SPREADSHEET_NAME)
     comp_ws = comp_ss.worksheet(COMPLAINT_TAB_NAME)
     comp_ws.append_row(row)
@@ -293,6 +338,9 @@ def get_ist_timestamp():
 
 @st.cache_data(ttl=120)
 def fetch_recent_complaints(limit=5000):
+    if client is None:
+        st.warning("Google credentials not configured. Cannot fetch complaints.")
+        return pd.DataFrame()
     comp_ss = client.open(COMPLAINT_SPREADSHEET_NAME)
     comp_ws = comp_ss.worksheet(COMPLAINT_TAB_NAME)
     records = comp_ws.get_all_records()
@@ -303,7 +351,11 @@ def fetch_recent_complaints(limit=5000):
 def upload_to_drive(file):
     if not file:
         return ""
-    drive_service = get_drive_service()
+    try:
+        drive_service = get_drive_service_try()
+    except Exception as e:
+        logger.error(f"upload_to_drive: drive auth failed: {e}")
+        raise RuntimeError("Drive credentials not configured. Cannot upload file.")
     file_metadata = {"name": file.name, "parents": [DRIVE_FOLDER_ID]}
     media = MediaIoBaseUpload(io.BytesIO(file.getvalue()), mimetype=file.type)
     uploaded = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
@@ -312,10 +364,13 @@ def upload_to_drive(file):
     return f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
 
 # ----------------------------
-# FIXED: Implementation Data Loader (handles duplicate headers)
+# Fixed: Implementation Data Loader (handles duplicate headers)
 # ----------------------------
 @st.cache_data(ttl=300)
 def load_implementation_data():
+    if client is None:
+        st.warning("Google credentials not configured. Implementation data cannot be loaded.")
+        return pd.DataFrame()
     impl_ss = client.open(IMPL_SPREADSHEET_NAME)
     impl_ws = impl_ss.worksheet(IMPL_TAB_NAME)
     values = impl_ws.get_all_values()
@@ -463,17 +518,13 @@ def build_monthly_report(df_all, year:int, month:int):
     # prepare CSV attachment of monthly complaints
     csv_bytes = None
     if not df_month.empty:
-        # Keep meaningful columns for CSV: ts_col, status, cat, school, severity, attachment
         keep_cols = []
         for c in [ts_col, status_col, cat_col, school_col, severity_col, closed_ts_col]:
             if c:
                 keep_cols.append(c)
-        # fallback to sending all columns
         export_df = df_month.copy()
         if keep_cols:
-            # ensure keep cols are present
             export_cols = [c for c in keep_cols if c in export_df.columns]
-            # also include everything else to be safe
             export_df = export_df[export_cols + [c for c in export_df.columns if c not in export_cols]]
         csv_bytes = export_df.to_csv(index=False).encode("utf-8")
 
@@ -515,7 +566,6 @@ def format_report_text(report):
 # ----------------------------
 st.set_page_config(page_title="CS App", page_icon="📝", layout="wide")
 
-# NOTE: Implementation Monitoring is hidden for now. To re-enable later, add it back to the options list.
 selected = option_menu(
     menu_title="",
     options=["Complaints Dashboard"],  # only show complaints for now
@@ -535,14 +585,23 @@ selected = option_menu(
 if selected == "Complaints Dashboard":
     st.title("📝 CS Complaint Dashboard")
 
+    # If client is missing, show big banner with guidance
+    if client is None:
+        st.error(
+            "Google service account credentials not found. The app can run but Google Sheets/Drive features are disabled.\n\n"
+            "Provide credentials in one of these ways:\n"
+            " • Streamlit Secrets: add `GCP_SERVICE_ACCOUNT` (table) or `GCP_SERVICE_ACCOUNT_JSON` (JSON string).\n"
+            " • Environment: set `GCP_SERVICE_ACCOUNT_JSON` to the JSON content.\n"
+            " • Set `GOOGLE_APPLICATION_CREDENTIALS` to a key file path or upload `service_account.json` to the app folder.\n\n"
+            "Check Streamlit → Manage app → Secrets. See logs for more details."
+        )
+
     st.sidebar.header("⚙️ Complaint Controls")
     if st.sidebar.button("🔄 Refresh complaints"):
-        # Clear cached data then attempt to rerun; if rerun not available, force reload via query params
         st.cache_data.clear()
         try:
             st.experimental_rerun()
         except Exception:
-            # fallback - update st.query_params (new style) to force Streamlit to reload
             params = dict(st.query_params) if hasattr(st, "query_params") else {}
             params["_refresh"] = str(int(time.time()))
             st.query_params = params
@@ -565,7 +624,6 @@ if selected == "Complaints Dashboard":
                 attachments = []
                 if csv_bytes:
                     attachments.append({"filename": f"complaints_{sel_year}_{sel_month_idx:02d}.csv", "content": csv_bytes, "mimetype": "text/csv"})
-                # send to admin and manager
                 to_list = [ADMIN_EMAIL, MANAGER_EMAIL]
                 ok, err = send_email_with_attachments(to_list, f"📊 Monthly Complaints Report - {sel_month_idx:02d}/{sel_year}", body, attachments=attachments)
                 if ok:
@@ -600,9 +658,9 @@ if selected == "Complaints Dashboard":
 
     st.markdown("---")
 
-    # PROFESSIONAL COMPLAINT FORM
+    # (the rest of the UI / form is the same as your original code)
     st.markdown("""
-    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 padding: 1rem; border-radius: 12px; margin: 1rem 0;">
         <h3 style="color: white; text-align: center; margin: 0; font-weight: 600;">
             📝 Submit New Complaint
@@ -613,7 +671,7 @@ if selected == "Complaints Dashboard":
     </div>
     """, unsafe_allow_html=True)
 
-    # Main form container with professional styling
+    # Main form container with styling (same as your original code)
     with st.container():
         st.markdown("""
         <style>
@@ -643,133 +701,68 @@ if selected == "Complaints Dashboard":
         }
         </style>
         """, unsafe_allow_html=True)
-        
-        # Form wrapper
+
         st.markdown('<div class="complaint-form">', unsafe_allow_html=True)
-        
+
         with st.form("complaint_form", clear_on_submit=True):
-            # Reporter Information Section
             st.markdown('<div class="section-header">👤 Reporter Information</div>', unsafe_allow_html=True)
             col1, col2 = st.columns([1, 1], gap="large")
-            
+
             with col1:
-                reporter = st.text_input(
-                    "Reporter",
-                    placeholder="Enter your name",
-                    help="This will be used for correspondence regarding your complaint",
-                    key="reporter_name"
-                )
+                reporter = st.text_input("Reporter", placeholder="Enter your name", help="This will be used for correspondence regarding your complaint", key="reporter_name")
                 st.markdown('<span class="required-field">*Required</span>', unsafe_allow_html=True)
-                
+
             with col2:
                 schools = load_school_names()
                 if schools:
-                    school = st.selectbox(
-                        "School/Institution",
-                        schools,
-                        index=0,
-                        help="Select your school from the dropdown",
-                        key="reporter_school"
-                    )
+                    school = st.selectbox("School/Institution", schools, index=0, help="Select your school from the dropdown", key="reporter_school")
                 else:
-                    school = st.text_input(
-                        "School/Institution",
-                        placeholder="Enter your school name",
-                        help="Please type your school name manually",
-                        key="reporter_school_manual"
-                    )
+                    school = st.text_input("School/Institution", placeholder="Enter your school name", help="Please type your school name manually", key="reporter_school_manual")
                 st.markdown('<span class="required-field">*Required</span>', unsafe_allow_html=True)
-            
-            st.markdown('<div style="margin: 1.5rem 0;"></div>', unsafe_allow_html=True)  # Spacer
-            
-            # Complaint Details Section
+
+            st.markdown('<div style="margin: 1.5rem 0;"></div>', unsafe_allow_html=True)
+
             st.markdown('<div class="section-header">📋 Complaint Details</div>', unsafe_allow_html=True)
-            
             col3, col4 = st.columns([1, 1], gap="large")
-            
             with col3:
-                category = st.selectbox(
-                    "Issue Category",
-                    ["Login Issue", "Access Issue", "Content Issue", "Technical", "Other"],
-                    help="Select the category that best describes your issue",
-                    key="complaint_category"
-                )
+                category = st.selectbox("Issue Category", ["Login Issue", "Access Issue", "Content Issue", "Technical", "Other"], help="Select the category that best describes your issue", key="complaint_category")
                 st.markdown('<span class="required-field">*Required</span>', unsafe_allow_html=True)
-                
             with col4:
-                severity = st.selectbox(
-                    "Priority Level",
-                    ["High", "Medium", "Low"],
-                    index=1,  # Default to Medium
-                    help="High: Urgent issue affecting work\nMedium: Important but not urgent\nLow: Minor issue or suggestion",
-                    key="complaint_severity"
-                )
+                severity = st.selectbox("Priority Level", ["High", "Medium", "Low"], index=1, help="High: Urgent issue affecting work\nMedium: Important but not urgent\nLow: Minor issue or suggestion", key="complaint_severity")
                 st.markdown('<span class="required-field">*Required</span>', unsafe_allow_html=True)
-            
-            st.markdown('<div style="margin: 1rem 0;"></div>', unsafe_allow_html=True)  # Spacer
-            
-            # Description Section
+
+            st.markdown('<div style="margin: 1rem 0;"></div>', unsafe_allow_html=True)
+
             st.markdown('<div class="section-header">📝 Issue Description</div>', unsafe_allow_html=True)
-            description = st.text_area(
-                "Detailed Description",
-                height=120,
-                placeholder="Please provide a clear and detailed description of the issue you are experiencing.",
-                help="The more details you provide, the better we can assist you",
-                key="complaint_description"
-            )
+            description = st.text_area("Detailed Description", height=120, placeholder="Please provide a clear and detailed description of the issue you are experiencing.", help="The more details you provide, the better we can assist you", key="complaint_description")
             st.markdown('<span class="required-field">*Required</span>', unsafe_allow_html=True)
-            
-            st.markdown('<div style="margin: 1.5rem 0;"></div>', unsafe_allow_html=True)  # Spacer
-            
-            # Attachment Section
+
+            st.markdown('<div style="margin: 1.5rem 0;"></div>', unsafe_allow_html=True)
+
             st.markdown('<div class="section-header">📎 Supporting Documents</div>', unsafe_allow_html=True)
-            uploaded_file = st.file_uploader(
-                "Upload Supporting Files (Optional)",
-                type=["pdf", "jpg", "jpeg", "png", "docx", "xlsx"],
-                help="You can attach screenshots, documents, or other files that help explain your issue",
-                key="complaint_attachment"
-            )
-            
-            # Submit button with professional styling
+            uploaded_file = st.file_uploader("Upload Supporting Files (Optional)", type=["pdf", "jpg", "jpeg", "png", "docx", "xlsx"], help="You can attach screenshots, documents, or other files that help explain your issue", key="complaint_attachment")
+
             st.markdown('<div style="margin: 2rem 0 1rem 0;"></div>', unsafe_allow_html=True)
-            
+
             col_submit = st.columns([1, 2, 1])
             with col_submit[1]:
-                submitted = st.form_submit_button(
-                    "🚀 Submit Complaint",
-                    use_container_width=True,
-                    type="primary"
-                )
-        
-        st.markdown('</div>', unsafe_allow_html=True)  # Close form wrapper
-        
-        # Form submission logic
+                submitted = st.form_submit_button("🚀 Submit Complaint", use_container_width=True, type="primary")
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
         if submitted:
-            required_fields = {
-                "Reporter Name": reporter, 
-                "School": school, 
-                "Category": category,
-                "Severity": severity, 
-                "Description": description
-            }
+            required_fields = {"Reporter Name": reporter, "School": school, "Category": category, "Severity": severity, "Description": description}
             missing = [k for k, v in required_fields.items() if not str(v).strip()]
-            
             if missing:
                 st.error(f"⚠️ Please complete the following required fields: **{', '.join(missing)}**")
             else:
                 try:
-                    # Show processing message
                     with st.spinner("Processing your complaint..."):
                         file_link = upload_to_drive(uploaded_file) if uploaded_file else ""
-                        row = [get_ist_timestamp(), school, reporter, category, severity,
-                               description, "Open", file_link]
+                        row = [get_ist_timestamp(), school, reporter, category, severity, description, "Open", file_link]
                         append_complaint_row(row)
-                    
-                    # Success message with better formatting
                     st.success("✅ **Complaint Submitted Successfully!**")
                     st.info("📧 You will receive a confirmation email shortly with your complaint details and reference number.")
-
-                    # Send emails
                     reporter_email = get_reporter_email(reporter)
                     if reporter_email:
                         body = f"""Dear {reporter},
@@ -790,13 +783,10 @@ Customer Success Team
 """
                         send_email_with_attachments(reporter_email, "Complaint Registered - Confirmation", body)
                         send_email_with_attachments(ADMIN_EMAIL, f"New Complaint Submitted by {reporter}", body)
-                        
                 except Exception as e:
                     st.error(f"❌ **Submission Failed:** We encountered an error while processing your complaint. Please try again or contact support directly.\n\nTechnical details: {str(e)}")
 
-    # Add some spacing after the form
     st.markdown('<div style="margin: 2rem 0;"></div>', unsafe_allow_html=True)
-
     st.markdown("---")
 
     # Recent complaints
@@ -820,41 +810,11 @@ Customer Success Team
     except Exception as e:
         st.error(f"❌ Could not load recent complaints. Details: {e}")
 
-# ----------------------------
-# Implementation Monitoring (HIDDEN)
-# To re-enable: replace `if False:` with `if True:` OR restore it to the menu options above.
-# ----------------------------
+# Implementation Monitoring (hidden)
 if False:
-    # Entire Implementation Monitoring block is intentionally wrapped in `if False` so it doesn't run.
-    # (The original code you provided for Implementation Monitoring is preserved here for easy re-enable.)
     st.title("📈 Implementation Monitoring")
-
     df_impl = load_implementation_data()
     if df_impl.empty:
         st.info("ℹ️ No implementation data available.")
     else:
-        # Normalize column names to ease lookups
-        cols_map = {c: c for c in df_impl.columns}
-        lower_cols = {c.lower(): c for c in df_impl.columns}
-
-        # helper to get column by list of possible keywords
-        def col_for(*keywords):
-            for kw in keywords:
-                for c in df_impl.columns:
-                    if kw.lower() in c.lower():
-                        return c
-            return None
-
-        # find key columns robustly
-        school_col = col_for("school name", "school")
-        zone_col = col_for("zone")
-        welcome_col = col_for("welcome mail", "welcome", "welcome mail status")
-        induction_col = col_for("induction training", "induction")
-        capacity_col = col_for("capacity building", "capacity")
-        proflearn_col = col_for("professional learning", "professional learning", "professional")
-        refresher_col = col_for("refresher", "refresher training")
-        contract_end_col = col_for("contract end", "contract end date", "contract end date")
-        retention_col = col_for("retention probability", "retention prob", "retention probablity", "retention")
-
-        # ... (rest of your original Implementation Monitoring code remains here)
         st.info("Implementation Monitoring is currently hidden. Re-enable when ready.")
