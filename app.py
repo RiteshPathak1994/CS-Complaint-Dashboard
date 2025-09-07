@@ -53,32 +53,58 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 # ----------------------------
-# AUTH (robust: supports st.secrets, env JSON, GOOGLE_APPLICATION_CREDENTIALS, local file)
+# Helper to convert table-style secret to service-account-info dict
+# ----------------------------
+def _secrets_table_to_info(table):
+    """
+    Convert a Streamlit TOML table (st.secrets['GCP_SERVICE_ACCOUNT']) to the
+    dict expected by google.oauth2.service_account.Credentials.from_service_account_info.
+    """
+    info = {}
+    # copy keys directly; private_key should be a single multiline string already
+    for k, v in table.items():
+        info[k] = v
+    return info
+
+# ----------------------------
+# AUTH (robust: supports st.secrets table, st.secrets JSON, env JSON, GOOGLE_APPLICATION_CREDENTIALS, local file)
 # ----------------------------
 @st.cache_resource
 def get_gspread_client():
     """
-    Create and return a gspread client using credentials resolved from:
-      1) st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
-      2) env var GCP_SERVICE_ACCOUNT_JSON (full JSON string)
-      3) GOOGLE_APPLICATION_CREDENTIALS path
-      4) local service_account.json file
+    Create and return a gspread client using credentials resolved from (in order):
+      1) st.secrets["GCP_SERVICE_ACCOUNT_JSON"] (full JSON string)
+      2) st.secrets["GCP_SERVICE_ACCOUNT"] (table-style: keys of the JSON)
+      3) env var GCP_SERVICE_ACCOUNT_JSON (full JSON string)
+      4) GOOGLE_APPLICATION_CREDENTIALS path
+      5) local service_account.json file
     """
     scope = ["https://www.googleapis.com/auth/spreadsheets",
              "https://www.googleapis.com/auth/drive"]
 
-    # 1) Streamlit secrets
+    # 1) Streamlit secrets: JSON string
     try:
         if isinstance(st.secrets, dict) and "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
-            secret_json = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
-            logger.info("Auth: using GCP_SERVICE_ACCOUNT_JSON from st.secrets")
-            info = json.loads(secret_json) if isinstance(secret_json, str) else secret_json
+            raw = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
+            logger.info("Auth: using st.secrets['GCP_SERVICE_ACCOUNT_JSON']")
+            info = json.loads(raw) if isinstance(raw, str) else raw
             creds = Credentials.from_service_account_info(info, scopes=scope)
             return gspread.authorize(creds)
     except Exception as e:
-        logger.warning(f"Auth (st.secrets) failed: {e}")
+        logger.warning(f"Auth (st.secrets JSON) failed: {e}")
 
-    # 2) Environment variable with JSON content
+    # 2) Streamlit secrets: table-style (TOML)
+    try:
+        if isinstance(st.secrets, dict) and "GCP_SERVICE_ACCOUNT" in st.secrets:
+            table = st.secrets["GCP_SERVICE_ACCOUNT"]
+            logger.info("Auth: using st.secrets['GCP_SERVICE_ACCOUNT'] table")
+            info = _secrets_table_to_info(table)
+            creds = Credentials.from_service_account_info(info, scopes=scope)
+            return gspread.authorize(creds)
+    except Exception as e:
+        logger.warning(f"Auth (st.secrets table) failed: {e}")
+
+    # 3) Environment variable with JSON content
     env_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
     if env_json:
         try:
@@ -89,7 +115,7 @@ def get_gspread_client():
         except Exception as e:
             logger.warning(f"Auth (env JSON) failed: {e}")
 
-    # 3) GOOGLE_APPLICATION_CREDENTIALS path (standard)
+    # 4) GOOGLE_APPLICATION_CREDENTIALS path (standard)
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_path:
         try:
@@ -102,7 +128,7 @@ def get_gspread_client():
         except Exception as e:
             logger.warning(f"Auth (GOOGLE_APPLICATION_CREDENTIALS) failed: {e}")
 
-    # 4) Local service_account.json (last resort)
+    # 5) Local service_account.json (last resort)
     local_path = "service_account.json"
     if os.path.exists(local_path):
         try:
@@ -115,7 +141,7 @@ def get_gspread_client():
     # Nothing worked — raise informative error so user sees it in logs/UI
     raise RuntimeError(
         "Google service account credentials not found. Provide credentials by one of the following:\n"
-        "1) On Streamlit Cloud: Manage app → Secrets → add GCP_SERVICE_ACCOUNT_JSON with the full JSON key.\n"
+        "1) On Streamlit Cloud: Manage app → Secrets → add GCP_SERVICE_ACCOUNT (table) or GCP_SERVICE_ACCOUNT_JSON (full JSON string).\n"
         "2) Set environment variable GCP_SERVICE_ACCOUNT_JSON to the full JSON content.\n"
         "3) Set GOOGLE_APPLICATION_CREDENTIALS to the path to a key file on the server.\n"
         "4) Place service_account.json in the app folder (not recommended for public repos).\n"
@@ -127,39 +153,55 @@ def get_drive_service():
     """
     scope = ["https://www.googleapis.com/auth/drive"]
 
-    # 1) st.secrets
+    # 1) st.secrets JSON
     try:
         if isinstance(st.secrets, dict) and "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
-            info = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
+            raw = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
+            info = json.loads(raw) if isinstance(raw, str) else raw
             creds = Credentials.from_service_account_info(info, scopes=scope)
+            logger.info("Drive auth: using st.secrets['GCP_SERVICE_ACCOUNT_JSON']")
             return build("drive", "v3", credentials=creds)
     except Exception as e:
-        logger.warning(f"Drive auth (st.secrets) failed: {e}")
+        logger.warning(f"Drive auth (st.secrets JSON) failed: {e}")
 
-    # 2) env JSON
+    # 2) st.secrets table
+    try:
+        if isinstance(st.secrets, dict) and "GCP_SERVICE_ACCOUNT" in st.secrets:
+            table = st.secrets["GCP_SERVICE_ACCOUNT"]
+            info = _secrets_table_to_info(table)
+            creds = Credentials.from_service_account_info(info, scopes=scope)
+            logger.info("Drive auth: using st.secrets['GCP_SERVICE_ACCOUNT'] table")
+            return build("drive", "v3", credentials=creds)
+    except Exception as e:
+        logger.warning(f"Drive auth (st.secrets table) failed: {e}")
+
+    # 3) env JSON
     env_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
     if env_json:
         try:
             info = json.loads(env_json)
             creds = Credentials.from_service_account_info(info, scopes=scope)
+            logger.info("Drive auth: using env GCP_SERVICE_ACCOUNT_JSON")
             return build("drive", "v3", credentials=creds)
         except Exception as e:
             logger.warning(f"Drive auth (env JSON) failed: {e}")
 
-    # 3) GOOGLE_APPLICATION_CREDENTIALS
+    # 4) GOOGLE_APPLICATION_CREDENTIALS
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_path and os.path.exists(creds_path):
         try:
             creds = Credentials.from_service_account_file(creds_path, scopes=scope)
+            logger.info("Drive auth: using GOOGLE_APPLICATION_CREDENTIALS file")
             return build("drive", "v3", credentials=creds)
         except Exception as e:
             logger.warning(f"Drive auth (GOOGLE_APPLICATION_CREDENTIALS) failed: {e}")
 
-    # 4) local file
+    # 5) local file
     local_path = "service_account.json"
     if os.path.exists(local_path):
         try:
             creds = Credentials.from_service_account_file(local_path, scopes=scope)
+            logger.info("Drive auth: using local service_account.json")
             return build("drive", "v3", credentials=creds)
         except Exception as e:
             logger.warning(f"Drive auth (local file) failed: {e}")
