@@ -19,6 +19,8 @@ import plotly.express as px
 from streamlit_option_menu import option_menu
 import calendar
 import time
+import json
+import logging
 
 # ----------------------------
 # CONFIG
@@ -36,27 +38,140 @@ MANAGER_EMAIL = os.getenv("MANAGER_EMAIL", "manager_email@gmail.com")
 DRIVE_FOLDER_ID = "12s1H0gbboQo-Ha_d86Miack9QvX6wHde"   # complaint attachments folder
 
 # ----------------------------
-# AUTH
+# Load local .env (for local dev)
+# ----------------------------
+load_dotenv()
+
+# ----------------------------
+# Minimal logger for auth-related info (streamlit logs)
+# ----------------------------
+logger = logging.getLogger("cs_complaint_auth")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# ----------------------------
+# AUTH (robust: supports st.secrets, env JSON, GOOGLE_APPLICATION_CREDENTIALS, local file)
 # ----------------------------
 @st.cache_resource
 def get_gspread_client():
+    """
+    Create and return a gspread client using credentials resolved from:
+      1) st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
+      2) env var GCP_SERVICE_ACCOUNT_JSON (full JSON string)
+      3) GOOGLE_APPLICATION_CREDENTIALS path
+      4) local service_account.json file
+    """
     scope = ["https://www.googleapis.com/auth/spreadsheets",
              "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_file("service_account.json", scopes=scope)
-    return gspread.authorize(creds)
 
-client = get_gspread_client()
+    # 1) Streamlit secrets
+    try:
+        if isinstance(st.secrets, dict) and "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
+            secret_json = st.secrets["GCP_SERVICE_ACCOUNT_JSON"]
+            logger.info("Auth: using GCP_SERVICE_ACCOUNT_JSON from st.secrets")
+            info = json.loads(secret_json) if isinstance(secret_json, str) else secret_json
+            creds = Credentials.from_service_account_info(info, scopes=scope)
+            return gspread.authorize(creds)
+    except Exception as e:
+        logger.warning(f"Auth (st.secrets) failed: {e}")
+
+    # 2) Environment variable with JSON content
+    env_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    if env_json:
+        try:
+            logger.info("Auth: using GCP_SERVICE_ACCOUNT_JSON from environment variable")
+            info = json.loads(env_json)
+            creds = Credentials.from_service_account_info(info, scopes=scope)
+            return gspread.authorize(creds)
+        except Exception as e:
+            logger.warning(f"Auth (env JSON) failed: {e}")
+
+    # 3) GOOGLE_APPLICATION_CREDENTIALS path (standard)
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if creds_path:
+        try:
+            if os.path.exists(creds_path):
+                logger.info(f"Auth: using service account file from GOOGLE_APPLICATION_CREDENTIALS: {creds_path}")
+                creds = Credentials.from_service_account_file(creds_path, scopes=scope)
+                return gspread.authorize(creds)
+            else:
+                logger.warning(f"GOOGLE_APPLICATION_CREDENTIALS is set but file not found: {creds_path}")
+        except Exception as e:
+            logger.warning(f"Auth (GOOGLE_APPLICATION_CREDENTIALS) failed: {e}")
+
+    # 4) Local service_account.json (last resort)
+    local_path = "service_account.json"
+    if os.path.exists(local_path):
+        try:
+            logger.info("Auth: using local service_account.json")
+            creds = Credentials.from_service_account_file(local_path, scopes=scope)
+            return gspread.authorize(creds)
+        except Exception as e:
+            logger.warning(f"Auth (local file) failed: {e}")
+
+    # Nothing worked — raise informative error so user sees it in logs/UI
+    raise RuntimeError(
+        "Google service account credentials not found. Provide credentials by one of the following:\n"
+        "1) On Streamlit Cloud: Manage app → Secrets → add GCP_SERVICE_ACCOUNT_JSON with the full JSON key.\n"
+        "2) Set environment variable GCP_SERVICE_ACCOUNT_JSON to the full JSON content.\n"
+        "3) Set GOOGLE_APPLICATION_CREDENTIALS to the path to a key file on the server.\n"
+        "4) Place service_account.json in the app folder (not recommended for public repos).\n"
+    )
 
 def get_drive_service():
+    """
+    Build a Drive v3 service using the same credential resolution as get_gspread_client.
+    """
     scope = ["https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_file("service_account.json", scopes=scope)
-    return build("drive", "v3", credentials=creds)
+
+    # 1) st.secrets
+    try:
+        if isinstance(st.secrets, dict) and "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
+            info = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
+            creds = Credentials.from_service_account_info(info, scopes=scope)
+            return build("drive", "v3", credentials=creds)
+    except Exception as e:
+        logger.warning(f"Drive auth (st.secrets) failed: {e}")
+
+    # 2) env JSON
+    env_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    if env_json:
+        try:
+            info = json.loads(env_json)
+            creds = Credentials.from_service_account_info(info, scopes=scope)
+            return build("drive", "v3", credentials=creds)
+        except Exception as e:
+            logger.warning(f"Drive auth (env JSON) failed: {e}")
+
+    # 3) GOOGLE_APPLICATION_CREDENTIALS
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if creds_path and os.path.exists(creds_path):
+        try:
+            creds = Credentials.from_service_account_file(creds_path, scopes=scope)
+            return build("drive", "v3", credentials=creds)
+        except Exception as e:
+            logger.warning(f"Drive auth (GOOGLE_APPLICATION_CREDENTIALS) failed: {e}")
+
+    # 4) local file
+    local_path = "service_account.json"
+    if os.path.exists(local_path):
+        try:
+            creds = Credentials.from_service_account_file(local_path, scopes=scope)
+            return build("drive", "v3", credentials=creds)
+        except Exception as e:
+            logger.warning(f"Drive auth (local file) failed: {e}")
+
+    raise RuntimeError("Could not create Drive service because no service account credentials were found.")
+
+# create gspread client (cached)
+client = get_gspread_client()
 
 # ----------------------------
 # EMAIL HELPER
 # ----------------------------
-load_dotenv()
-
 def send_email_with_attachments(to_emails, subject, body, attachments=None):
     """
     to_emails: list or comma-separated string
