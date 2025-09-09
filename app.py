@@ -21,7 +21,8 @@ import calendar
 import time
 import json
 import logging
-# 🔎 DEBUG TEST (REMOVE after verifying)
+
+
 
 
 # ----------------------------
@@ -173,6 +174,8 @@ def get_gspread_client_try():
         except Exception as e:
             logger.warning(f"Auth using in-memory info failed: {e}")
 
+    
+
     # 2) GOOGLE_APPLICATION_CREDENTIALS path
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_path:
@@ -185,6 +188,7 @@ def get_gspread_client_try():
                 logger.warning(f"GOOGLE_APPLICATION_CREDENTIALS set but file not found: {creds_path}")
         except Exception as e:
             logger.warning(f"Auth (GOOGLE_APPLICATION_CREDENTIALS) failed: {e}")
+            
 
     # 3) local file
     local_path = "service_account.json"
@@ -248,6 +252,7 @@ try:
 except Exception as e:
     client = None
     logger.error(f"Could not create gspread client: {e}")
+    
 
 # ----------------------------
 # EMAIL HELPER
@@ -448,6 +453,7 @@ def build_monthly_report(df_all, year:int, month:int):
     school_col = find_col(df_all, ["school", "institution", "organisation", "organization"])
     severity_col = find_col(df_all, ["priority", "severity"])
     closed_ts_col = find_col(df_all, ["closed", "resolved", "closed timestamp", "resolved timestamp", "closed_at", "resolved_at"])
+    product_col = find_col(df_all, ["product"])  # <-- ADDED to include product if present
 
     # Parse timestamp column
     if ts_col:
@@ -521,7 +527,7 @@ def build_monthly_report(df_all, year:int, month:int):
     csv_bytes = None
     if not df_month.empty:
         keep_cols = []
-        for c in [ts_col, status_col, cat_col, school_col, severity_col, closed_ts_col]:
+        for c in [ts_col, status_col, cat_col, school_col, severity_col, product_col, closed_ts_col]:  # <-- MODIFIED to include product_col
             if c:
                 keep_cols.append(c)
         export_df = df_month.copy()
@@ -735,6 +741,11 @@ if selected == "Complaints Dashboard":
 
             st.markdown('<div style="margin: 1rem 0;"></div>', unsafe_allow_html=True)
 
+            # <-- ADDED: Product dropdown
+            st.markdown('<div class="section-header">🔖 Product</div>', unsafe_allow_html=True)
+            product = st.selectbox("Product", ["BELLS", "HB", "PBL"], index=0, help="Select the product related to this complaint", key="complaint_product")
+            st.markdown('<span class="required-field">*Required</span>', unsafe_allow_html=True)
+
             st.markdown('<div class="section-header">📝 Issue Description</div>', unsafe_allow_html=True)
             description = st.text_area("Detailed Description", height=120, placeholder="Please provide a clear and detailed description of the issue you are experiencing.", help="The more details you provide, the better we can assist you", key="complaint_description")
             st.markdown('<span class="required-field">*Required</span>', unsafe_allow_html=True)
@@ -753,7 +764,8 @@ if selected == "Complaints Dashboard":
         st.markdown('</div>', unsafe_allow_html=True)
 
         if submitted:
-            required_fields = {"Reporter Name": reporter, "School": school, "Category": category, "Severity": severity, "Description": description}
+            # <-- MODIFIED: include Product in required fields
+            required_fields = {"Reporter Name": reporter, "School": school, "Category": category, "Severity": severity, "Product": product, "Description": description}
             missing = [k for k, v in required_fields.items() if not str(v).strip()]
             if missing:
                 st.error(f"⚠️ Please complete the following required fields: **{', '.join(missing)}**")
@@ -761,7 +773,9 @@ if selected == "Complaints Dashboard":
                 try:
                     with st.spinner("Processing your complaint..."):
                         file_link = upload_to_drive(uploaded_file) if uploaded_file else ""
-                        row = [get_ist_timestamp(), school, reporter, category, severity, description, "Open", file_link]
+                        # <-- MODIFIED: include product field in the appended row
+                        # Order: Timestamp, School, Reporter, Category, Severity, Product, Description, Status, Attachment
+                        row = [get_ist_timestamp(), school, reporter, category, severity, product, description, "Open", file_link]
                         append_complaint_row(row)
                     st.success("✅ **Complaint Submitted Successfully!**")
                     st.info("📧 You will receive a confirmation email shortly with your complaint details and reference number.")
@@ -773,6 +787,7 @@ Your complaint has been registered successfully.
 
 Complaint Details:
 • School: {school}
+• Product: {product}
 • Category: {category}
 • Priority: {severity}
 • Description: {description}
