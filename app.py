@@ -19,7 +19,7 @@ import calendar
 import time
 import json
 import logging
-import dropbox   # Dropbox SDK
+import dropbox   # ✅ Dropbox for attachments
 
 # ----------------------------
 # CONFIG
@@ -228,8 +228,6 @@ def _get_dropbox_client_from_secrets():
     if refresh_token and app_key and app_secret:
         # Use refresh-token flow (recommended)
         logger.info("Dropbox: using refresh-token auth from secrets/env")
-        # dropbox.Dropbox supports oauth2_refresh_token + app_key/app_secret
-        # This will automatically refresh access tokens when needed.
         return dropbox.Dropbox(oauth2_refresh_token=refresh_token, app_key=app_key, app_secret=app_secret)
     elif access_token:
         logger.info("Dropbox: using plain access token (dev/test mode)")
@@ -246,35 +244,22 @@ def upload_to_dropbox(file):
 
         # ensure filename is safe
         filename = file.name
-        # Use app folder root path; if app has App Folder permission it's contained.
         dropbox_path = f"/{filename}"
 
-        # Upload bytes - overwrite if exists
         content = file.getvalue()
-        # For large files you might want to use files_upload_session_start/append/finish
         dbx.files_upload(content, dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
 
-        # Create or fetch a shared link
         try:
             res = dbx.sharing_create_shared_link_with_settings(dropbox_path)
             link = res.url
-            logger.info("Dropbox: created new shared link")
-        except dropbox.exceptions.ApiError as e:
-            # If link already exists, get it
-            try:
-                links_res = dbx.sharing_list_shared_links(path=dropbox_path, direct_only=True)
-                links = links_res.links
-                if links:
-                    link = links[0].url
-                    logger.info("Dropbox: reused existing shared link")
-                else:
-                    logger.error("Dropbox: could not create or find shared link")
-                    raise
-            except Exception as ex:
-                logger.error(f"Dropbox sharing error: {ex}")
+        except dropbox.exceptions.ApiError:
+            links_res = dbx.sharing_list_shared_links(path=dropbox_path, direct_only=True)
+            links = links_res.links
+            if links:
+                link = links[0].url
+            else:
                 raise
 
-        # Convert to direct-download (dl=1)
         if link.endswith("?dl=0"):
             link = link.replace("?dl=0", "?dl=1")
         elif "?dl=1" not in link:
@@ -363,12 +348,125 @@ def load_school_names():
     schools = [r[school_col_idx].strip() for r in rows if len(r) > school_col_idx and r[school_col_idx].strip()]
     return list(dict.fromkeys(schools))  # unique
 
-def append_complaint_row(row):
+def _find_header_index(headers, candidates):
+    """
+    Return index in headers for the first candidate that matches (case-insensitive contains).
+    headers: list of header strings
+    candidates: list of variants e.g. ["File link", "Attachment Link"]
+    returns index or None
+    """
+    if not headers:
+        return None
+    lower_headers = [str(h).lower() for h in headers]
+    for cand in candidates:
+        cand_l = cand.lower()
+        for i, h in enumerate(lower_headers):
+            if cand_l == h or cand_l in h or h in cand_l:
+                return i
+    return None
+
+def append_complaint_row_dict(row_dict):
+    """
+    Append a complaint row to the spreadsheet by matching header names.
+    row_dict: dict mapping logical field names to values. Expected logical names:
+      - timestamp, school, reporter, category, severity, product, description, status, tat, file_link
+    The sheet's header row is inspected; values are placed into matching columns.
+    Any headers not found are left blank. If sheet has extra columns, those are preserved.
+    If sheet is shorter than mapping, extra values are appended at the end.
+    """
     if client is None:
         raise RuntimeError("Google credentials not configured. Cannot append complaint.")
     comp_ss = client.open(COMPLAINT_SPREADSHEET_NAME)
     comp_ws = comp_ss.worksheet(COMPLAINT_TAB_NAME)
-    comp_ws.append_row(row)
+
+    # read header row
+    headers = comp_ws.row_values(1)
+    num_cols = max(1, len(headers))
+
+    # prepare output row with blanks
+    out_row = [""] * num_cols
+
+    # mapping of logical names -> list of header candidate strings (common variants)
+    mapping = {
+        "timestamp": ["timestamp", "time", "created", "created at"],
+        "school": ["school", "institution", "organisation", "organization"],
+        "reporter": ["reporter", "reporter name", "name"],
+        "category": ["category", "issue", "type"],
+        "severity": ["priority", "severity"],
+        "product": ["product", "prod"],
+        "description": ["description", "details", "issue description", "comment"],
+        "status": ["status"],
+        "tat": ["tat", "turnaround time", "turnaround", "tat (hrs)"],
+        "file_link": ["file link", "attachment link", "attachment", "file", "attachment_url", "attachment link (direct)"]
+    }
+
+    # helper to set value into out_row at header match index
+    def set_for_logical(key, value):
+        nonlocal out_row, headers
+        candidates = mapping.get(key, [key])
+        idx = _find_header_index(headers, candidates)
+        if idx is not None and idx < len(out_row):
+            out_row[idx] = value
+            return True
+        return False
+
+    # set values based on row_dict logical keys
+    # Attempt to use provided keys in logical names as well as permissive matching
+    # Use lowercased keys for matching
+    val_map = {}
+    for k, v in row_dict.items():
+        val_map[k.lower()] = v
+
+    # set each logical field
+    set_for_logical("timestamp", val_map.get("timestamp") or val_map.get("time") or val_map.get("created") or "")
+    set_for_logical("school", val_map.get("school") or "")
+    set_for_logical("reporter", val_map.get("reporter") or val_map.get("reporter name") or "")
+    set_for_logical("category", val_map.get("category") or val_map.get("issue") or "")
+    set_for_logical("severity", val_map.get("severity") or val_map.get("priority") or "")
+    set_for_logical("product", val_map.get("product") or "")
+    set_for_logical("description", val_map.get("description") or val_map.get("details") or "")
+    set_for_logical("status", val_map.get("status") or "Open")
+    # TAT may be intentionally empty
+    set_for_logical("tat", val_map.get("tat") or "")
+
+    # file link should go to 'File link' or 'Attachment Link' if present; otherwise end of row
+    file_val = val_map.get("file_link") or val_map.get("attachment") or val_map.get("attachment link") or ""
+    set_ok = set_for_logical("file_link", file_val)
+    if not set_ok:
+        # no header found for file_link: append to end of out_row
+        out_row.append(file_val)
+
+    # If the sheet has fewer columns in header but there are extra mandatory fields, ensure all values are placed:
+    # If any of the logical fields were not placed because header shorter, append them in a stable order
+    # Identify which logical fields weren't matched (by checking if any header candidate exists)
+    # We already appended file if missing; others are less critical but we handle timestamp if missing
+    # If timestamp header didn't exist, ensure timestamp is at start
+    ts_idx = _find_header_index(headers, mapping["timestamp"])
+    if ts_idx is None:
+        # ensure timestamp at start
+        ts_val = val_map.get("timestamp") or get_ist_timestamp()
+        out_row.insert(0, ts_val)
+
+    # Append the row to the sheet
+    comp_ws.append_row(out_row)
+
+def append_complaint_row(row):
+    """
+    Backwards-compatible helper: accepts a list or dict.
+    If list -> append directly (legacy).
+    If dict -> use append_complaint_row_dict to place values into appropriate columns.
+    """
+    if isinstance(row, dict):
+        append_complaint_row_dict(row)
+    elif isinstance(row, (list, tuple)):
+        # legacy: append list directly
+        if client is None:
+            raise RuntimeError("Google credentials not configured. Cannot append complaint.")
+        comp_ss = client.open(COMPLAINT_SPREADSHEET_NAME)
+        comp_ws = comp_ss.worksheet(COMPLAINT_TAB_NAME)
+        comp_ws.append_row(list(row))
+    else:
+        raise ValueError("append_complaint_row expects a list or dict")
 
 def get_ist_timestamp():
     tz = pytz.timezone("Asia/Kolkata")
@@ -480,7 +578,7 @@ def build_monthly_report(df_all, year:int, month:int):
     csv_bytes = None
     if not df_month.empty:
         keep_cols = []
-        for c in [ts_col, status_col, cat_col, school_col, severity_col, product_col, closed_ts_col]:  # <-- MODIFIED to include product_col
+        for c in [ts_col, status_col, cat_col, school_col, severity_col, product_col, closed_ts_col]:
             if c:
                 keep_cols.append(c)
         export_df = df_month.copy()
@@ -653,7 +751,7 @@ if selected == "Complaints Dashboard":
 
     st.markdown("---")
 
-    # Header card
+    # (the rest of the UI / form is the same as your original code)
     st.markdown("""
     <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 padding: 1rem; border-radius: 12px; margin: 1rem 0;">
@@ -666,7 +764,7 @@ if selected == "Complaints Dashboard":
     </div>
     """, unsafe_allow_html=True)
 
-    # Main form container with styling
+    # Main form container with styling (same as your original code)
     with st.container():
         st.markdown("""
         <style>
@@ -728,7 +826,7 @@ if selected == "Complaints Dashboard":
 
             st.markdown('<div style="margin: 1rem 0;"></div>', unsafe_allow_html=True)
 
-            # Product dropdown
+            # <-- ADDED: Product dropdown
             st.markdown('<div class="section-header">🔖 Product</div>', unsafe_allow_html=True)
             product = st.selectbox("Product", ["BELLS", "HB", "PBL"], index=0, help="Select the product related to this complaint", key="complaint_product")
             st.markdown('<span class="required-field">*Required</span>', unsafe_allow_html=True)
@@ -746,12 +844,12 @@ if selected == "Complaints Dashboard":
 
             col_submit = st.columns([1, 2, 1])
             with col_submit[1]:
-                submitted = st.form_submit_button("🚀 Submit Complaint", use_container_width=False, type="primary")
+                submitted = st.form_submit_button("🚀 Submit Complaint", use_container_width=True, type="primary")
 
         st.markdown('</div>', unsafe_allow_html=True)
 
         if submitted:
-            # include Product in required fields
+            # <-- MODIFIED: include Product in required fields
             required_fields = {"Reporter Name": reporter, "School": school, "Category": category, "Severity": severity, "Product": product, "Description": description}
             missing = [k for k, v in required_fields.items() if not str(v).strip()]
             if missing:
@@ -759,24 +857,22 @@ if selected == "Complaints Dashboard":
             else:
                 try:
                     with st.spinner("Processing your complaint..."):
-                        # Upload file to Dropbox and get link (if provided)
                         file_link = upload_to_dropbox(uploaded_file) if uploaded_file else ""
-                        # Order of columns in the sheet expected:
-                        # Timestamp, School, Reporter, Category, Severity, Product, Description, Status, TAT, Attachment Link
-                        # NOTE: we insert an explicit empty placeholder for TAT so Attachment Link lands in its column
-                        row = [
-                            get_ist_timestamp(),  # Timestamp
-                            school,
-                            reporter,
-                            category,
-                            severity,
-                            product,
-                            description,
-                            "Open",  # Status
-                            "",      # TAT placeholder (so the next cell is Attachment Link)
-                            file_link  # Attachment Link
-                        ]
-                        append_complaint_row(row)
+                        # Build a dict and let append_complaint_row_dict place fields into correct columns,
+                        # ensuring the file link goes into "File link" / "Attachment Link" / "Attachment" if present.
+                        row_dict = {
+                            "timestamp": get_ist_timestamp(),
+                            "school": school,
+                            "reporter": reporter,
+                            "category": category,
+                            "severity": severity,
+                            "product": product,
+                            "description": description,
+                            "status": "Open",
+                            "tat": "",  # intentionally blank; sheet TAT column (if present) will remain blank
+                            "file_link": file_link
+                        }
+                        append_complaint_row(row_dict)
                     st.success("✅ **Complaint Submitted Successfully!**")
                     st.info("📧 You will receive a confirmation email shortly with your complaint details and reference number.")
                     reporter_email = get_reporter_email(reporter)
@@ -813,35 +909,24 @@ Customer Success Team
         if df_recent.empty:
             st.info("ℹ️ No complaints found yet.")
         else:
-            # Normalize TAT column to string (prevents pyarrow/streamlit errors)
-            if "TAT" in df_recent.columns:
-                try:
-                    df_recent["TAT"] = df_recent["TAT"].astype(str).fillna("")
-                except Exception:
-                    # fallback - coerce each value to str
-                    df_recent["TAT"] = df_recent["TAT"].apply(lambda x: "" if pd.isna(x) else str(x))
-
-            # Normalize Attachment column name - handle both old and new names
-            if "Attachment Link" in df_recent.columns:
-                att_col = "Attachment Link"
-            elif "Attachment" in df_recent.columns:
-                att_col = "Attachment"
-                # rename to standardized name for display & links
-                df_recent = df_recent.rename(columns={"Attachment": "Attachment Link"})
-                att_col = "Attachment Link"
+            if status_filter != "All" and "Status" in df_recent.columns:
+                df_recent = df_recent[df_recent["Status"].astype(str).str.strip().str.lower() == status_filter.lower()]
+            if df_recent.empty:
+                st.info(f"ℹ️ No complaints with status '{status_filter}'.")
             else:
-                att_col = None
-
-            # Apply display formatting
-            if att_col:
-                df_recent["Attachment Link"] = df_recent["Attachment Link"].apply(lambda x: f"[📎 View File]({x})" if x and str(x).strip() else "")
-            if "Status" in df_recent.columns:
-                color_map = {"open": "🔴 Open", "in progress": "🟠 In Progress", "closed": "🟢 Closed"}
-                df_recent["Status"] = df_recent["Status"].apply(lambda x: color_map.get(str(x).strip().lower(), x))
-
-            # Use width="stretch" (Streamlit's newer parameter replacement for use_container_width)
-            st.dataframe(df_recent, width="stretch", hide_index=True)
-
+                # Prefer 'File link', but accept 'Attachment Link' or 'Attachment'
+                display_link_col = None
+                for candidate in ["File link", "File Link", "Attachment Link", "Attachment", "Attachment Link"]:
+                    if candidate in df_recent.columns:
+                        display_link_col = candidate
+                        break
+                # if attachment column present normalize and render clickable
+                if display_link_col:
+                    df_recent[display_link_col] = df_recent[display_link_col].apply(lambda x: f"[📎 View File]({x})" if x and str(x).strip() else "")
+                if "Status" in df_recent.columns:
+                    color_map = {"open": "🔴 Open", "in progress": "🟠 In Progress", "closed": "🟢 Closed"}
+                    df_recent["Status"] = df_recent["Status"].apply(lambda x: color_map.get(str(x).strip().lower(), x))
+                st.dataframe(df_recent, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"❌ Could not load recent complaints. Details: {e}")
 
