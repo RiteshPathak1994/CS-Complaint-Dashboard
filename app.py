@@ -1,4 +1,4 @@
-# full_app.py - Professional Version (Dropbox for attachments, Drive removed, refresh-token aware)
+# full_app.py - Professional Version (Dropbox for attachments, Drive removed)
 import streamlit as st
 import pandas as pd
 import gspread
@@ -210,71 +210,84 @@ except Exception as e:
     logger.error(f"Could not create gspread client: {e}")
 
 # ----------------------------
-# Dropbox Upload (refresh-token aware)
+# Helper: Dropbox client creation (support refresh token flow)
+# ----------------------------
+def get_dropbox_client():
+    """
+    Create a dropbox.Dropbox client.
+    Supports:
+      - st.secrets: DROPBOX_REFRESH_TOKEN, DROPBOX_APP_KEY, DROPBOX_APP_SECRET
+      - or st.secrets: DROPBOX_ACCESS_TOKEN (dev/test)
+      - environment variables as fallback
+    Returns a dropbox.Dropbox instance or raises RuntimeError.
+    """
+    # prefer st.secrets
+    secrets = st.secrets if isinstance(st.secrets, dict) else {}
+    refresh_token = secrets.get("DROPBOX_REFRESH_TOKEN") or os.environ.get("DROPBOX_REFRESH_TOKEN")
+    app_key = secrets.get("DROPBOX_APP_KEY") or os.environ.get("DROPBOX_APP_KEY")
+    app_secret = secrets.get("DROPBOX_APP_SECRET") or os.environ.get("DROPBOX_APP_SECRET")
+    access_token = secrets.get("DROPBOX_ACCESS_TOKEN") or os.environ.get("DROPBOX_ACCESS_TOKEN")
+
+    if refresh_token and app_key and app_secret:
+        try:
+            # Dropbox SDK will automatically fetch short-lived tokens using refresh token if provided
+            dbx = dropbox.Dropbox(
+                app_key=app_key,
+                app_secret=app_secret,
+                oauth2_refresh_token=refresh_token
+            )
+            # quick test: get current account to verify token is valid
+            dbx.users_get_current_account()
+            return dbx
+        except Exception as e:
+            logger.warning(f"Dropbox refresh-token client creation failed: {e}")
+            # fall through to try access_token (if present)
+    if access_token:
+        try:
+            dbx = dropbox.Dropbox(access_token)
+            dbx.users_get_current_account()
+            return dbx
+        except Exception as e:
+            logger.warning(f"Dropbox access-token client creation failed: {e}")
+
+    raise RuntimeError(
+        "Dropbox credentials not found or invalid. Provide DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET "
+        "(recommended) in st.secrets or environment, or provide DROPBOX_ACCESS_TOKEN for temporary testing."
+    )
+
+# ----------------------------
+# Dropbox Upload
 # ----------------------------
 def upload_to_dropbox(file):
     """Upload file to Dropbox and return a shareable link (direct download)."""
     if not file:
         return ""
     try:
-        # Determine auth method: prefer refresh token (recommended), fall back to access token
-        dbx = None
+        dbx = get_dropbox_client()
 
-        # st.secrets may not be a dict in some contexts, guard accordingly
-        secrets_map = st.secrets if isinstance(st.secrets, dict) else {}
-
-        if all(k in secrets_map for k in ("DROPBOX_REFRESH_TOKEN", "DROPBOX_APP_KEY", "DROPBOX_APP_SECRET")):
-            # Use refresh token auth (long-lived)
-            dbx = dropbox.Dropbox(
-                oauth2_refresh_token=secrets_map["DROPBOX_REFRESH_TOKEN"],
-                app_key=secrets_map["DROPBOX_APP_KEY"],
-                app_secret=secrets_map["DROPBOX_APP_SECRET"]
-            )
-            logger.info("Dropbox: using refresh-token auth")
-        elif "DROPBOX_ACCESS_TOKEN" in secrets_map:
-            dbx = dropbox.Dropbox(secrets_map["DROPBOX_ACCESS_TOKEN"])
-            logger.info("Dropbox: using access token from st.secrets")
-        else:
-            # fallback to environment variables (useful for local dev or other hosts)
-            env_refresh = os.environ.get("DROPBOX_REFRESH_TOKEN")
-            env_key = os.environ.get("DROPBOX_APP_KEY")
-            env_secret = os.environ.get("DROPBOX_APP_SECRET")
-            env_access = os.environ.get("DROPBOX_ACCESS_TOKEN")
-            if env_refresh and env_key and env_secret:
-                dbx = dropbox.Dropbox(oauth2_refresh_token=env_refresh, app_key=env_key, app_secret=env_secret)
-                logger.info("Dropbox: using refresh-token auth from environment")
-            elif env_access:
-                dbx = dropbox.Dropbox(env_access)
-                logger.info("Dropbox: using access token from environment")
-            else:
-                raise RuntimeError("Dropbox credentials not found in st.secrets or environment. Provide DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET (recommended) or DROPBOX_ACCESS_TOKEN for testing.")
-
-        # Build a safe filename (optionally, you can add timestamp or unique prefix)
+        # ensure filename is safe
         filename = file.name
-        # Put files under app folder root; if your app uses "App folder" permission, this path is inside app folder
+        # Use app folder root path; if app has App Folder permission it's contained.
         dropbox_path = f"/{filename}"
 
-        # Upload
+        # Upload the file (overwrite existing)
         dbx.files_upload(file.getvalue(), dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
-        logger.info(f"Dropbox: uploaded {filename} to {dropbox_path}")
 
-        # Create or fetch shared link
+        # Create shared link (if exists, API will return existing)
         try:
             res = dbx.sharing_create_shared_link_with_settings(dropbox_path)
             link = res.url
-            logger.info("Dropbox: created new shared link")
         except dropbox.exceptions.ApiError as e:
-            # Possibly link already exists -> list and reuse
+            # if link already exists, get it
             try:
-                links = dbx.sharing_list_shared_links(path=dropbox_path, direct_only=True).links
+                links_list = dbx.sharing_list_shared_links(path=dropbox_path, direct_only=True)
+                links = getattr(links_list, "links", [])
                 if links:
                     link = links[0].url
-                    logger.info("Dropbox: reused existing shared link")
                 else:
-                    logger.error("Dropbox: no existing shared links and creation failed")
                     raise
-            except Exception as e2:
-                logger.error(f"Dropbox: sharing link retrieval failed: {e2}")
+            except Exception as ex:
+                logger.error(f"Failed to create or list shared link: {ex}")
                 raise
 
         # Convert to direct-download
@@ -411,6 +424,9 @@ def build_monthly_report(df_all, year:int, month:int):
     closed_ts_col = find_col(df_all, ["closed", "resolved", "closed timestamp", "resolved timestamp", "closed_at", "resolved_at"])
     product_col = find_col(df_all, ["product"])  # <-- ADDED to include product if present
 
+    # ATTACHMENT detection: look for likely names
+    attach_col = find_col(df_all, ["attachment link", "attachment", "attach", "file", "attachment_url", "attachmentlink"])
+
     # Parse timestamp column
     if ts_col:
         df_all["_ts"] = parse_dates_series(df_all[ts_col])
@@ -479,11 +495,11 @@ def build_monthly_report(df_all, year:int, month:int):
                 avg_close_hours = round(float(diffs.mean()), 2)
     report['avg_close_hours'] = avg_close_hours
 
-    # prepare CSV attachment of monthly complaints
+    # prepare CSV attachment of monthly complaints (include attachment col if present)
     csv_bytes = None
     if not df_month.empty:
         keep_cols = []
-        for c in [ts_col, status_col, cat_col, school_col, severity_col, product_col, closed_ts_col]:  # <-- MODIFIED to include product_col
+        for c in [ts_col, status_col, cat_col, school_col, severity_col, product_col, closed_ts_col, attach_col]:
             if c:
                 keep_cols.append(c)
         export_df = df_month.copy()
@@ -762,9 +778,23 @@ if selected == "Complaints Dashboard":
             else:
                 try:
                     with st.spinner("Processing your complaint..."):
+                        # Upload to Dropbox (if an attachment is provided)
                         file_link = upload_to_dropbox(uploaded_file) if uploaded_file else ""
-                        # Order: Timestamp, School, Reporter, Category, Severity, Product, Description, Status, Attachment
-                        row = [get_ist_timestamp(), school, reporter, category, severity, product, description, "Open", file_link]
+                        # NEW ORDER: Timestamp, School, Reporter, Category, Severity, Product, Description,
+                        #            Status, Closed Time (empty), TAT (empty), Attachment Link
+                        row = [
+                            get_ist_timestamp(),  # Timestamp
+                            school,               # School
+                            reporter,             # Reporter
+                            category,             # Category
+                            severity,             # Severity
+                            product,              # Product
+                            description,          # Description
+                            "Open",               # Status
+                            "",                   # Closed Time (empty at creation)
+                            "",                   # TAT (empty at creation)
+                            file_link             # Attachment Link
+                        ]
                         append_complaint_row(row)
                     st.success("✅ **Complaint Submitted Successfully!**")
                     st.info("📧 You will receive a confirmation email shortly with your complaint details and reference number.")
@@ -807,7 +837,10 @@ Customer Success Team
             if df_recent.empty:
                 st.info(f"ℹ️ No complaints with status '{status_filter}'.")
             else:
-                if "Attachment" in df_recent.columns:
+                # Prefer the new column "Attachment Link" (migration). Fall back to legacy "Attachment".
+                if "Attachment Link" in df_recent.columns:
+                    df_recent["Attachment Link"] = df_recent["Attachment Link"].apply(lambda x: f"[📎 View File]({x})" if x else "")
+                elif "Attachment" in df_recent.columns:
                     df_recent["Attachment"] = df_recent["Attachment"].apply(lambda x: f"[📎 View File]({x})" if x else "")
                 if "Status" in df_recent.columns:
                     color_map = {"open": "🔴 Open", "in progress": "🟠 In Progress", "closed": "🟢 Closed"}
