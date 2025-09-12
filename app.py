@@ -1,4 +1,4 @@
-# full_app.py - Professional Version (Dropbox for attachments, Drive removed)
+# app.py - Professional Version (Dropbox for attachments, Drive removed)
 import streamlit as st
 import pandas as pd
 import gspread
@@ -19,7 +19,7 @@ import calendar
 import time
 import json
 import logging
-import dropbox   # ✅ Dropbox for attachments
+import dropbox   # Dropbox SDK
 
 # ----------------------------
 # CONFIG
@@ -210,18 +210,15 @@ except Exception as e:
     logger.error(f"Could not create gspread client: {e}")
 
 # ----------------------------
-# Helper: Dropbox client creation (support refresh token flow)
+# Dropbox Upload
 # ----------------------------
-def get_dropbox_client():
+def _get_dropbox_client_from_secrets():
     """
-    Create a dropbox.Dropbox client.
-    Supports:
-      - st.secrets: DROPBOX_REFRESH_TOKEN, DROPBOX_APP_KEY, DROPBOX_APP_SECRET
-      - or st.secrets: DROPBOX_ACCESS_TOKEN (dev/test)
-      - environment variables as fallback
-    Returns a dropbox.Dropbox instance or raises RuntimeError.
+    Create a Dropbox client. Prefer refresh-token flow (long lived) if provided:
+      - DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET
+    Fallback to DROPBOX_ACCESS_TOKEN (dev/test only).
     """
-    # prefer st.secrets
+    # Prefer st.secrets then environment
     secrets = st.secrets if isinstance(st.secrets, dict) else {}
     refresh_token = secrets.get("DROPBOX_REFRESH_TOKEN") or os.environ.get("DROPBOX_REFRESH_TOKEN")
     app_key = secrets.get("DROPBOX_APP_KEY") or os.environ.get("DROPBOX_APP_KEY")
@@ -229,68 +226,55 @@ def get_dropbox_client():
     access_token = secrets.get("DROPBOX_ACCESS_TOKEN") or os.environ.get("DROPBOX_ACCESS_TOKEN")
 
     if refresh_token and app_key and app_secret:
-        try:
-            # Dropbox SDK will automatically fetch short-lived tokens using refresh token if provided
-            dbx = dropbox.Dropbox(
-                app_key=app_key,
-                app_secret=app_secret,
-                oauth2_refresh_token=refresh_token
-            )
-            # quick test: get current account to verify token is valid
-            dbx.users_get_current_account()
-            return dbx
-        except Exception as e:
-            logger.warning(f"Dropbox refresh-token client creation failed: {e}")
-            # fall through to try access_token (if present)
-    if access_token:
-        try:
-            dbx = dropbox.Dropbox(access_token)
-            dbx.users_get_current_account()
-            return dbx
-        except Exception as e:
-            logger.warning(f"Dropbox access-token client creation failed: {e}")
+        # Use refresh-token flow (recommended)
+        logger.info("Dropbox: using refresh-token auth from secrets/env")
+        # dropbox.Dropbox supports oauth2_refresh_token + app_key/app_secret
+        # This will automatically refresh access tokens when needed.
+        return dropbox.Dropbox(oauth2_refresh_token=refresh_token, app_key=app_key, app_secret=app_secret)
+    elif access_token:
+        logger.info("Dropbox: using plain access token (dev/test mode)")
+        return dropbox.Dropbox(access_token)
+    else:
+        raise RuntimeError("Dropbox credentials not found in st.secrets or environment. Provide DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET (recommended) or DROPBOX_ACCESS_TOKEN for testing.")
 
-    raise RuntimeError(
-        "Dropbox credentials not found or invalid. Provide DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET "
-        "(recommended) in st.secrets or environment, or provide DROPBOX_ACCESS_TOKEN for temporary testing."
-    )
-
-# ----------------------------
-# Dropbox Upload
-# ----------------------------
 def upload_to_dropbox(file):
     """Upload file to Dropbox and return a shareable link (direct download)."""
     if not file:
         return ""
     try:
-        dbx = get_dropbox_client()
+        dbx = _get_dropbox_client_from_secrets()
 
         # ensure filename is safe
         filename = file.name
         # Use app folder root path; if app has App Folder permission it's contained.
         dropbox_path = f"/{filename}"
 
-        # Upload the file (overwrite existing)
-        dbx.files_upload(file.getvalue(), dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
+        # Upload bytes - overwrite if exists
+        content = file.getvalue()
+        # For large files you might want to use files_upload_session_start/append/finish
+        dbx.files_upload(content, dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
 
-        # Create shared link (if exists, API will return existing)
+        # Create or fetch a shared link
         try:
             res = dbx.sharing_create_shared_link_with_settings(dropbox_path)
             link = res.url
+            logger.info("Dropbox: created new shared link")
         except dropbox.exceptions.ApiError as e:
-            # if link already exists, get it
+            # If link already exists, get it
             try:
-                links_list = dbx.sharing_list_shared_links(path=dropbox_path, direct_only=True)
-                links = getattr(links_list, "links", [])
+                links_res = dbx.sharing_list_shared_links(path=dropbox_path, direct_only=True)
+                links = links_res.links
                 if links:
                     link = links[0].url
+                    logger.info("Dropbox: reused existing shared link")
                 else:
+                    logger.error("Dropbox: could not create or find shared link")
                     raise
             except Exception as ex:
-                logger.error(f"Failed to create or list shared link: {ex}")
+                logger.error(f"Dropbox sharing error: {ex}")
                 raise
 
-        # Convert to direct-download
+        # Convert to direct-download (dl=1)
         if link.endswith("?dl=0"):
             link = link.replace("?dl=0", "?dl=1")
         elif "?dl=1" not in link:
@@ -424,9 +408,6 @@ def build_monthly_report(df_all, year:int, month:int):
     closed_ts_col = find_col(df_all, ["closed", "resolved", "closed timestamp", "resolved timestamp", "closed_at", "resolved_at"])
     product_col = find_col(df_all, ["product"])  # <-- ADDED to include product if present
 
-    # ATTACHMENT detection: look for likely names
-    attach_col = find_col(df_all, ["attachment link", "attachment", "attach", "file", "attachment_url", "attachmentlink"])
-
     # Parse timestamp column
     if ts_col:
         df_all["_ts"] = parse_dates_series(df_all[ts_col])
@@ -495,11 +476,11 @@ def build_monthly_report(df_all, year:int, month:int):
                 avg_close_hours = round(float(diffs.mean()), 2)
     report['avg_close_hours'] = avg_close_hours
 
-    # prepare CSV attachment of monthly complaints (include attachment col if present)
+    # prepare CSV attachment of monthly complaints
     csv_bytes = None
     if not df_month.empty:
         keep_cols = []
-        for c in [ts_col, status_col, cat_col, school_col, severity_col, product_col, closed_ts_col, attach_col]:
+        for c in [ts_col, status_col, cat_col, school_col, severity_col, product_col, closed_ts_col]:  # <-- MODIFIED to include product_col
             if c:
                 keep_cols.append(c)
         export_df = df_month.copy()
@@ -606,7 +587,7 @@ if selected == "Complaints Dashboard":
             "Provide credentials in one of these ways:\n"
             " • Streamlit Secrets: add `GCP_SERVICE_ACCOUNT` (table) or `GCP_SERVICE_ACCOUNT_JSON` (JSON string).\n"
             " • Environment: set `GCP_SERVICE_ACCOUNT_JSON` to the JSON content.\n"
-            " • Set `GOOGLE_APPLICATION_CREDENTIALS` to the path to a key file on the server.\n\n"
+            " • Set `GOOGLE_APPLICATION_CREDENTIALS` to a key file path or upload `service_account.json` to the app folder.\n\n"
             "Check Streamlit → Manage app → Secrets. See logs for more details."
         )
 
@@ -672,7 +653,7 @@ if selected == "Complaints Dashboard":
 
     st.markdown("---")
 
-    # (the rest of the UI / form is the same as your original code)
+    # Header card
     st.markdown("""
     <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 padding: 1rem; border-radius: 12px; margin: 1rem 0;">
@@ -685,7 +666,7 @@ if selected == "Complaints Dashboard":
     </div>
     """, unsafe_allow_html=True)
 
-    # Main form container with styling (same as your original code)
+    # Main form container with styling
     with st.container():
         st.markdown("""
         <style>
@@ -747,7 +728,7 @@ if selected == "Complaints Dashboard":
 
             st.markdown('<div style="margin: 1rem 0;"></div>', unsafe_allow_html=True)
 
-            # <-- ADDED: Product dropdown
+            # Product dropdown
             st.markdown('<div class="section-header">🔖 Product</div>', unsafe_allow_html=True)
             product = st.selectbox("Product", ["BELLS", "HB", "PBL"], index=0, help="Select the product related to this complaint", key="complaint_product")
             st.markdown('<span class="required-field">*Required</span>', unsafe_allow_html=True)
@@ -765,12 +746,12 @@ if selected == "Complaints Dashboard":
 
             col_submit = st.columns([1, 2, 1])
             with col_submit[1]:
-                submitted = st.form_submit_button("🚀 Submit Complaint", use_container_width=True, type="primary")
+                submitted = st.form_submit_button("🚀 Submit Complaint", use_container_width=False, type="primary")
 
         st.markdown('</div>', unsafe_allow_html=True)
 
         if submitted:
-            # <-- MODIFIED: include Product in required fields
+            # include Product in required fields
             required_fields = {"Reporter Name": reporter, "School": school, "Category": category, "Severity": severity, "Product": product, "Description": description}
             missing = [k for k, v in required_fields.items() if not str(v).strip()]
             if missing:
@@ -778,22 +759,22 @@ if selected == "Complaints Dashboard":
             else:
                 try:
                     with st.spinner("Processing your complaint..."):
-                        # Upload to Dropbox (if an attachment is provided)
+                        # Upload file to Dropbox and get link (if provided)
                         file_link = upload_to_dropbox(uploaded_file) if uploaded_file else ""
-                        # NEW ORDER: Timestamp, School, Reporter, Category, Severity, Product, Description,
-                        #            Status, Closed Time (empty), TAT (empty), Attachment Link
+                        # Order of columns in the sheet expected:
+                        # Timestamp, School, Reporter, Category, Severity, Product, Description, Status, TAT, Attachment Link
+                        # NOTE: we insert an explicit empty placeholder for TAT so Attachment Link lands in its column
                         row = [
                             get_ist_timestamp(),  # Timestamp
-                            school,               # School
-                            reporter,             # Reporter
-                            category,             # Category
-                            severity,             # Severity
-                            product,              # Product
-                            description,          # Description
-                            "Open",               # Status
-                            "",                   # Closed Time (empty at creation)
-                            "",                   # TAT (empty at creation)
-                            file_link             # Attachment Link
+                            school,
+                            reporter,
+                            category,
+                            severity,
+                            product,
+                            description,
+                            "Open",  # Status
+                            "",      # TAT placeholder (so the next cell is Attachment Link)
+                            file_link  # Attachment Link
                         ]
                         append_complaint_row(row)
                     st.success("✅ **Complaint Submitted Successfully!**")
@@ -832,20 +813,35 @@ Customer Success Team
         if df_recent.empty:
             st.info("ℹ️ No complaints found yet.")
         else:
-            if status_filter != "All" and "Status" in df_recent.columns:
-                df_recent = df_recent[df_recent["Status"].astype(str).str.strip().str.lower() == status_filter.lower()]
-            if df_recent.empty:
-                st.info(f"ℹ️ No complaints with status '{status_filter}'.")
+            # Normalize TAT column to string (prevents pyarrow/streamlit errors)
+            if "TAT" in df_recent.columns:
+                try:
+                    df_recent["TAT"] = df_recent["TAT"].astype(str).fillna("")
+                except Exception:
+                    # fallback - coerce each value to str
+                    df_recent["TAT"] = df_recent["TAT"].apply(lambda x: "" if pd.isna(x) else str(x))
+
+            # Normalize Attachment column name - handle both old and new names
+            if "Attachment Link" in df_recent.columns:
+                att_col = "Attachment Link"
+            elif "Attachment" in df_recent.columns:
+                att_col = "Attachment"
+                # rename to standardized name for display & links
+                df_recent = df_recent.rename(columns={"Attachment": "Attachment Link"})
+                att_col = "Attachment Link"
             else:
-                # Prefer the new column "Attachment Link" (migration). Fall back to legacy "Attachment".
-                if "Attachment Link" in df_recent.columns:
-                    df_recent["Attachment Link"] = df_recent["Attachment Link"].apply(lambda x: f"[📎 View File]({x})" if x else "")
-                elif "Attachment" in df_recent.columns:
-                    df_recent["Attachment"] = df_recent["Attachment"].apply(lambda x: f"[📎 View File]({x})" if x else "")
-                if "Status" in df_recent.columns:
-                    color_map = {"open": "🔴 Open", "in progress": "🟠 In Progress", "closed": "🟢 Closed"}
-                    df_recent["Status"] = df_recent["Status"].apply(lambda x: color_map.get(str(x).strip().lower(), x))
-                st.dataframe(df_recent, use_container_width=True, hide_index=True)
+                att_col = None
+
+            # Apply display formatting
+            if att_col:
+                df_recent["Attachment Link"] = df_recent["Attachment Link"].apply(lambda x: f"[📎 View File]({x})" if x and str(x).strip() else "")
+            if "Status" in df_recent.columns:
+                color_map = {"open": "🔴 Open", "in progress": "🟠 In Progress", "closed": "🟢 Closed"}
+                df_recent["Status"] = df_recent["Status"].apply(lambda x: color_map.get(str(x).strip().lower(), x))
+
+            # Use width="stretch" (Streamlit's newer parameter replacement for use_container_width)
+            st.dataframe(df_recent, width="stretch", hide_index=True)
+
     except Exception as e:
         st.error(f"❌ Could not load recent complaints. Details: {e}")
 
