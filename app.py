@@ -368,11 +368,9 @@ def _find_header_index(headers, candidates):
 def append_complaint_row_dict(row_dict):
     """
     Append a complaint row to the spreadsheet by matching header names.
+    This version *forces* the file link into column 11 (1-indexed) => index 10 (0-indexed).
     row_dict: dict mapping logical field names to values. Expected logical names:
       - timestamp, school, reporter, category, severity, product, description, status, tat, file_link
-    The sheet's header row is inspected; values are placed into matching columns.
-    Any headers not found are left blank. If sheet has extra columns, those are preserved.
-    If sheet is shorter than mapping, extra values are appended at the end.
     """
     if client is None:
         raise RuntimeError("Google credentials not configured. Cannot append complaint.")
@@ -383,8 +381,9 @@ def append_complaint_row_dict(row_dict):
     headers = comp_ws.row_values(1)
     num_cols = max(1, len(headers))
 
-    # prepare output row with blanks
-    out_row = [""] * num_cols
+    # We must ensure out_row has at least 11 columns so index 10 exists
+    needed_cols = max(num_cols, 11)
+    out_row = [""] * needed_cols
 
     # mapping of logical names -> list of header candidate strings (common variants)
     mapping = {
@@ -397,28 +396,29 @@ def append_complaint_row_dict(row_dict):
         "description": ["description", "details", "issue description", "comment"],
         "status": ["status"],
         "tat": ["tat", "turnaround time", "turnaround", "tat (hrs)"],
-        "file_link": ["file link", "attachment link", "attachment", "file", "attachment_url", "attachment link (direct)"]
+        # file_link intentionally not used for header placement because we force column 11
     }
 
-    # helper to set value into out_row at header match index
+    # helper to set value into out_row at header match index (if found)
     def set_for_logical(key, value):
         nonlocal out_row, headers
         candidates = mapping.get(key, [key])
         idx = _find_header_index(headers, candidates)
-        if idx is not None and idx < len(out_row):
+        if idx is not None:
+            # If the index is out of current out_row, expand
+            if idx >= len(out_row):
+                out_row.extend([""] * (idx + 1 - len(out_row)))
             out_row[idx] = value
             return True
         return False
 
-    # set values based on row_dict logical keys
-    # Attempt to use provided keys in logical names as well as permissive matching
-    # Use lowercased keys for matching
+    # normalize keys
     val_map = {}
     for k, v in row_dict.items():
         val_map[k.lower()] = v
 
-    # set each logical field
-    set_for_logical("timestamp", val_map.get("timestamp") or val_map.get("time") or val_map.get("created") or "")
+    # Place logical fields by header if available
+    set_for_logical("timestamp", val_map.get("timestamp") or val_map.get("time") or val_map.get("created") or get_ist_timestamp())
     set_for_logical("school", val_map.get("school") or "")
     set_for_logical("reporter", val_map.get("reporter") or val_map.get("reporter name") or "")
     set_for_logical("category", val_map.get("category") or val_map.get("issue") or "")
@@ -426,28 +426,24 @@ def append_complaint_row_dict(row_dict):
     set_for_logical("product", val_map.get("product") or "")
     set_for_logical("description", val_map.get("description") or val_map.get("details") or "")
     set_for_logical("status", val_map.get("status") or "Open")
-    # TAT may be intentionally empty
     set_for_logical("tat", val_map.get("tat") or "")
 
-    # file link should go to 'File link' or 'Attachment Link' if present; otherwise end of row
+    # Force file link into 11th column (1-indexed) -> index 10
     file_val = val_map.get("file_link") or val_map.get("attachment") or val_map.get("attachment link") or ""
-    set_ok = set_for_logical("file_link", file_val)
-    if not set_ok:
-        # no header found for file_link: append to end of out_row
-        out_row.append(file_val)
+    target_index = 10  # 0-based index for 11th column
+    if target_index >= len(out_row):
+        out_row.extend([""] * (target_index + 1 - len(out_row)))
+    out_row[target_index] = file_val
 
-    # If the sheet has fewer columns in header but there are extra mandatory fields, ensure all values are placed:
-    # If any of the logical fields were not placed because header shorter, append them in a stable order
-    # Identify which logical fields weren't matched (by checking if any header candidate exists)
-    # We already appended file if missing; others are less critical but we handle timestamp if missing
-    # If timestamp header didn't exist, ensure timestamp is at start
-    ts_idx = _find_header_index(headers, mapping["timestamp"])
-    if ts_idx is None:
-        # ensure timestamp at start
-        ts_val = val_map.get("timestamp") or get_ist_timestamp()
-        out_row.insert(0, ts_val)
+    # Ensure timestamp exists at index 0 if sheet expects it; if not already set, put timestamp at start
+    if not out_row[0]:
+        out_row[0] = val_map.get("timestamp") or get_ist_timestamp()
 
-    # Append the row to the sheet
+    # If original sheet header had more columns than our out_row length, preserve by extending blanks
+    if len(headers) > len(out_row):
+        out_row.extend([""] * (len(headers) - len(out_row)))
+
+    # Append row
     comp_ws.append_row(out_row)
 
 def append_complaint_row(row):
@@ -859,7 +855,7 @@ if selected == "Complaints Dashboard":
                     with st.spinner("Processing your complaint..."):
                         file_link = upload_to_dropbox(uploaded_file) if uploaded_file else ""
                         # Build a dict and let append_complaint_row_dict place fields into correct columns,
-                        # ensuring the file link goes into "File link" / "Attachment Link" / "Attachment" if present.
+                        # with file link forced into the 11th column.
                         row_dict = {
                             "timestamp": get_ist_timestamp(),
                             "school": school,
@@ -914,15 +910,17 @@ Customer Success Team
             if df_recent.empty:
                 st.info(f"ℹ️ No complaints with status '{status_filter}'.")
             else:
-                # Prefer 'File link', but accept 'Attachment Link' or 'Attachment'
-                display_link_col = None
-                for candidate in ["File link", "File Link", "Attachment Link", "Attachment", "Attachment Link"]:
-                    if candidate in df_recent.columns:
-                        display_link_col = candidate
-                        break
-                # if attachment column present normalize and render clickable
-                if display_link_col:
-                    df_recent[display_link_col] = df_recent[display_link_col].apply(lambda x: f"[📎 View File]({x})" if x and str(x).strip() else "")
+                # If user wants to see the 11th column rendered as link, detect if df_recent has at least 11 columns
+                if df_recent.shape[1] >= 11:
+                    # convert to list of column names to determine 11th column name
+                    colname_11 = list(df_recent.columns)[10]  # 0-based index
+                    df_recent[colname_11] = df_recent[colname_11].apply(lambda x: f"[📎 View File]({x})" if x and str(x).strip() else "")
+                else:
+                    # fallback: try to find known attachment headers and render them
+                    for candidate in ["File link", "File Link", "Attachment Link", "Attachment", "Attachment Link"]:
+                        if candidate in df_recent.columns:
+                            df_recent[candidate] = df_recent[candidate].apply(lambda x: f"[📎 View File]({x})" if x and str(x).strip() else "")
+                            break
                 if "Status" in df_recent.columns:
                     color_map = {"open": "🔴 Open", "in progress": "🟠 In Progress", "closed": "🟢 Closed"}
                     df_recent["Status"] = df_recent["Status"].apply(lambda x: color_map.get(str(x).strip().lower(), x))
