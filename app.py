@@ -1,4 +1,4 @@
-# full_app.py - Complete Professional Version (enhanced monthly report)
+# full_app.py - Professional Version (Dropbox for attachments, Drive removed, refresh-token aware)
 import streamlit as st
 import pandas as pd
 import gspread
@@ -12,8 +12,6 @@ from email.mime.base import MIMEBase
 from email import encoders
 import os
 from dotenv import load_dotenv
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 import io
 import plotly.express as px
 from streamlit_option_menu import option_menu
@@ -21,9 +19,7 @@ import calendar
 import time
 import json
 import logging
-
-
-
+import dropbox   # ✅ Dropbox for attachments
 
 # ----------------------------
 # CONFIG
@@ -35,8 +31,6 @@ COMPLAINT_SPREADSHEET_NAME = "CS Comp"
 COMPLAINT_TAB_NAME = "Comp"
 
 REPORTER_SHEET_URL = "https://docs.google.com/spreadsheets/d/1OJWpQOwevw1W5iNUk6dm_wfZphuBdjboCkrQwYwTNOY/edit#gid=0"
-
-DRIVE_FOLDER_ID = "12s1H0gbboQo-Ha_d86Miack9QvX6wHde"   # complaint attachments folder
 
 # ----------------------------
 # Load local .env (for local dev)
@@ -107,7 +101,7 @@ EMAIL_USER = _secret_or_env("EMAIL_USER", os.environ.get("EMAIL_USER"))
 EMAIL_PASS = _secret_or_env("EMAIL_PASS", os.environ.get("EMAIL_PASS"))
 
 # ----------------------------
-# AUTH functions (robust)
+# AUTH functions (robust) for Google Sheets
 # ----------------------------
 def _resolve_service_account_info_from_secrets():
     """
@@ -174,8 +168,6 @@ def get_gspread_client_try():
         except Exception as e:
             logger.warning(f"Auth using in-memory info failed: {e}")
 
-    
-
     # 2) GOOGLE_APPLICATION_CREDENTIALS path
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if creds_path:
@@ -188,7 +180,6 @@ def get_gspread_client_try():
                 logger.warning(f"GOOGLE_APPLICATION_CREDENTIALS set but file not found: {creds_path}")
         except Exception as e:
             logger.warning(f"Auth (GOOGLE_APPLICATION_CREDENTIALS) failed: {e}")
-            
 
     # 3) local file
     local_path = "service_account.json"
@@ -210,41 +201,6 @@ def get_gspread_client_try():
         "4) Place service_account.json in the app folder (not recommended for public repos).\n"
     )
 
-def get_drive_service_try():
-    """
-    Attempt to create a Drive v3 service.
-    """
-    scope = ["https://www.googleapis.com/auth/drive"]
-
-    info = _resolve_service_account_info_from_secrets()
-    if info:
-        try:
-            creds = _create_creds_from_info(info, scopes=scope)
-            logger.info("Drive auth success using in-memory info")
-            return build("drive", "v3", credentials=creds)
-        except Exception as e:
-            logger.warning(f"Drive auth using in-memory info failed: {e}")
-
-    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if creds_path and os.path.exists(creds_path):
-        try:
-            creds = Credentials.from_service_account_file(creds_path, scopes=scope)
-            logger.info("Drive auth success using GOOGLE_APPLICATION_CREDENTIALS")
-            return build("drive", "v3", credentials=creds)
-        except Exception as e:
-            logger.warning(f"Drive auth (GOOGLE_APPLICATION_CREDENTIALS) failed: {e}")
-
-    local_path = "service_account.json"
-    if os.path.exists(local_path):
-        try:
-            creds = Credentials.from_service_account_file(local_path, scopes=scope)
-            logger.info("Drive auth success using local service_account.json")
-            return build("drive", "v3", credentials=creds)
-        except Exception as e:
-            logger.warning(f"Drive auth (local file) failed: {e}")
-
-    raise RuntimeError("Could not create Drive service because no service account credentials were found.")
-
 # Try to create client now but handle failures gracefully so app doesn't crash at import
 try:
     client = get_gspread_client_try()
@@ -252,7 +208,85 @@ try:
 except Exception as e:
     client = None
     logger.error(f"Could not create gspread client: {e}")
-    
+
+# ----------------------------
+# Dropbox Upload (refresh-token aware)
+# ----------------------------
+def upload_to_dropbox(file):
+    """Upload file to Dropbox and return a shareable link (direct download)."""
+    if not file:
+        return ""
+    try:
+        # Determine auth method: prefer refresh token (recommended), fall back to access token
+        dbx = None
+
+        # st.secrets may not be a dict in some contexts, guard accordingly
+        secrets_map = st.secrets if isinstance(st.secrets, dict) else {}
+
+        if all(k in secrets_map for k in ("DROPBOX_REFRESH_TOKEN", "DROPBOX_APP_KEY", "DROPBOX_APP_SECRET")):
+            # Use refresh token auth (long-lived)
+            dbx = dropbox.Dropbox(
+                oauth2_refresh_token=secrets_map["DROPBOX_REFRESH_TOKEN"],
+                app_key=secrets_map["DROPBOX_APP_KEY"],
+                app_secret=secrets_map["DROPBOX_APP_SECRET"]
+            )
+            logger.info("Dropbox: using refresh-token auth")
+        elif "DROPBOX_ACCESS_TOKEN" in secrets_map:
+            dbx = dropbox.Dropbox(secrets_map["DROPBOX_ACCESS_TOKEN"])
+            logger.info("Dropbox: using access token from st.secrets")
+        else:
+            # fallback to environment variables (useful for local dev or other hosts)
+            env_refresh = os.environ.get("DROPBOX_REFRESH_TOKEN")
+            env_key = os.environ.get("DROPBOX_APP_KEY")
+            env_secret = os.environ.get("DROPBOX_APP_SECRET")
+            env_access = os.environ.get("DROPBOX_ACCESS_TOKEN")
+            if env_refresh and env_key and env_secret:
+                dbx = dropbox.Dropbox(oauth2_refresh_token=env_refresh, app_key=env_key, app_secret=env_secret)
+                logger.info("Dropbox: using refresh-token auth from environment")
+            elif env_access:
+                dbx = dropbox.Dropbox(env_access)
+                logger.info("Dropbox: using access token from environment")
+            else:
+                raise RuntimeError("Dropbox credentials not found in st.secrets or environment. Provide DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET (recommended) or DROPBOX_ACCESS_TOKEN for testing.")
+
+        # Build a safe filename (optionally, you can add timestamp or unique prefix)
+        filename = file.name
+        # Put files under app folder root; if your app uses "App folder" permission, this path is inside app folder
+        dropbox_path = f"/{filename}"
+
+        # Upload
+        dbx.files_upload(file.getvalue(), dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
+        logger.info(f"Dropbox: uploaded {filename} to {dropbox_path}")
+
+        # Create or fetch shared link
+        try:
+            res = dbx.sharing_create_shared_link_with_settings(dropbox_path)
+            link = res.url
+            logger.info("Dropbox: created new shared link")
+        except dropbox.exceptions.ApiError as e:
+            # Possibly link already exists -> list and reuse
+            try:
+                links = dbx.sharing_list_shared_links(path=dropbox_path, direct_only=True).links
+                if links:
+                    link = links[0].url
+                    logger.info("Dropbox: reused existing shared link")
+                else:
+                    logger.error("Dropbox: no existing shared links and creation failed")
+                    raise
+            except Exception as e2:
+                logger.error(f"Dropbox: sharing link retrieval failed: {e2}")
+                raise
+
+        # Convert to direct-download
+        if link.endswith("?dl=0"):
+            link = link.replace("?dl=0", "?dl=1")
+        elif "?dl=1" not in link:
+            link = link + "?dl=1"
+
+        return link
+    except Exception as e:
+        logger.error(f"Dropbox upload failed: {e}")
+        raise RuntimeError(f"Dropbox upload failed: {e}")
 
 # ----------------------------
 # EMAIL HELPER
@@ -354,84 +388,6 @@ def fetch_recent_complaints(limit=5000):
     if not records:
         return pd.DataFrame()
     return pd.DataFrame(records).tail(limit)
-
-def upload_to_drive(file):
-    if not file:
-        return ""
-    try:
-        drive_service = get_drive_service_try()
-    except Exception as e:
-        logger.error(f"upload_to_drive: drive auth failed: {e}")
-        raise RuntimeError("Drive credentials not configured. Cannot upload file.")
-    file_metadata = {"name": file.name, "parents": [DRIVE_FOLDER_ID]}
-    media = MediaIoBaseUpload(io.BytesIO(file.getvalue()), mimetype=file.type)
-    uploaded = drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
-    file_id = uploaded.get("id")
-    drive_service.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}).execute()
-    return f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
-
-# ----------------------------
-# Fixed: Implementation Data Loader (handles duplicate headers)
-# ----------------------------
-@st.cache_data(ttl=300)
-def load_implementation_data():
-    if client is None:
-        st.warning("Google credentials not configured. Implementation data cannot be loaded.")
-        return pd.DataFrame()
-    impl_ss = client.open(IMPL_SPREADSHEET_NAME)
-    impl_ws = impl_ss.worksheet(IMPL_TAB_NAME)
-    values = impl_ws.get_all_values()
-    if not values:
-        return pd.DataFrame()
-    headers = values[0]
-    seen, fixed_headers = {}, []
-    for h in headers:
-        h = h.strip()
-        if h in seen:
-            seen[h] += 1
-            fixed_headers.append(f"{h}_{seen[h]}")
-        else:
-            seen[h] = 1
-            fixed_headers.append(h)
-    rows = values[1:]
-    df = pd.DataFrame(rows, columns=fixed_headers)
-    # normalize whitespace in column names
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
-# ----------------------------
-# Utility: find a column name by keyword(s)
-# ----------------------------
-def find_col(df, keywords):
-    """Return first column from df.columns that contains any of keywords (case-insensitive)."""
-    if df is None or df.columns.empty:
-        return None
-    cols = list(df.columns)
-    for kw in keywords:
-        for c in cols:
-            if kw.lower() in str(c).lower():
-                return c
-    return None
-
-def find_cols(df, keywords_list):
-    """Return list of matching columns for any of keywords_list (any match)."""
-    res = []
-    if df is None or df.columns.empty:
-        return res
-    cols = list(df.columns)
-    for c in cols:
-        lc = str(c).lower()
-        for kw in keywords_list:
-            if kw.lower() in lc:
-                res.append(c)
-                break
-    return res
-
-def is_completed_value(v):
-    if pd.isna(v):
-        return False
-    s = str(v).strip().lower()
-    return any(x in s for x in ["complete", "completed", "done", "yes", "y"])
 
 # ----------------------------
 # MONTHLY REPORT BUILDER
@@ -570,6 +526,40 @@ def format_report_text(report):
     return "\n".join(lines)
 
 # ----------------------------
+# Utility: find a column name by keyword(s)
+# ----------------------------
+def find_col(df, keywords):
+    """Return first column from df.columns that contains any of keywords (case-insensitive)."""
+    if df is None or df.columns.empty:
+        return None
+    cols = list(df.columns)
+    for kw in keywords:
+        for c in cols:
+            if kw.lower() in str(c).lower():
+                return c
+    return None
+
+def find_cols(df, keywords_list):
+    """Return list of matching columns for any of keywords_list (any match)."""
+    res = []
+    if df is None or df.columns.empty:
+        return res
+    cols = list(df.columns)
+    for c in cols:
+        lc = str(c).lower()
+        for kw in keywords_list:
+            if kw.lower() in lc:
+                res.append(c)
+                break
+    return res
+
+def is_completed_value(v):
+    if pd.isna(v):
+        return False
+    s = str(v).strip().lower()
+    return any(x in s for x in ["complete", "completed", "done", "yes", "y"])
+
+# ----------------------------
 # PAGE NAVIGATION (CLASSY LIGHT NAVBAR)
 # ----------------------------
 st.set_page_config(page_title="CS App", page_icon="📝", layout="wide")
@@ -600,7 +590,7 @@ if selected == "Complaints Dashboard":
             "Provide credentials in one of these ways:\n"
             " • Streamlit Secrets: add `GCP_SERVICE_ACCOUNT` (table) or `GCP_SERVICE_ACCOUNT_JSON` (JSON string).\n"
             " • Environment: set `GCP_SERVICE_ACCOUNT_JSON` to the JSON content.\n"
-            " • Set `GOOGLE_APPLICATION_CREDENTIALS` to a key file path or upload `service_account.json` to the app folder.\n\n"
+            " • Set `GOOGLE_APPLICATION_CREDENTIALS` to the path to a key file on the server.\n\n"
             "Check Streamlit → Manage app → Secrets. See logs for more details."
         )
 
@@ -772,8 +762,7 @@ if selected == "Complaints Dashboard":
             else:
                 try:
                     with st.spinner("Processing your complaint..."):
-                        file_link = upload_to_drive(uploaded_file) if uploaded_file else ""
-                        # <-- MODIFIED: include product field in the appended row
+                        file_link = upload_to_dropbox(uploaded_file) if uploaded_file else ""
                         # Order: Timestamp, School, Reporter, Category, Severity, Product, Description, Status, Attachment
                         row = [get_ist_timestamp(), school, reporter, category, severity, product, description, "Open", file_link]
                         append_complaint_row(row)
@@ -830,8 +819,8 @@ Customer Success Team
 # Implementation Monitoring (hidden)
 if False:
     st.title("📈 Implementation Monitoring")
-    df_impl = load_implementation_data()
-    if df_impl.empty:
+    df_impl = load_school_names()  # placeholder; original had load_implementation_data
+    if df_impl is None or len(df_impl) == 0:
         st.info("ℹ️ No implementation data available.")
     else:
         st.info("Implementation Monitoring is currently hidden. Re-enable when ready.")
