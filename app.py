@@ -1,4 +1,4 @@
-# full_app.py - Professional Version (Dropbox for attachments, Drive removed)
+# app.py - Professional Version (Dropbox for attachments, Drive removed)
 import streamlit as st
 import pandas as pd
 import gspread
@@ -20,7 +20,6 @@ import time
 import json
 import logging
 import dropbox   # ✅ Dropbox for attachments
-from typing import Dict, List, Optional
 
 # ----------------------------
 # CONFIG
@@ -211,97 +210,56 @@ except Exception as e:
     logger.error(f"Could not create gspread client: {e}")
 
 # ----------------------------
-# Dropbox Upload (supports refresh token flow if provided)
+# Dropbox Upload
 # ----------------------------
-def _get_dropbox_client() -> dropbox.Dropbox:
+def _get_dropbox_client_from_secrets():
     """
-    Return an authenticated Dropbox client.
-    Supports:
-      - st.secrets['DROPBOX_ACCESS_TOKEN'] (dev / short-lived token)
-      - OR refresh-token flow using DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET
+    Create a Dropbox client. Prefer refresh-token flow (long lived) if provided:
+      - DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET
+    Fallback to DROPBOX_ACCESS_TOKEN (dev/test only).
     """
-    # Prefer explicit access token for quick testing
-    access_token = None
-    if isinstance(st.secrets, dict) and "DROPBOX_ACCESS_TOKEN" in st.secrets:
-        access_token = st.secrets["DROPBOX_ACCESS_TOKEN"]
-    elif os.environ.get("DROPBOX_ACCESS_TOKEN"):
-        access_token = os.environ.get("DROPBOX_ACCESS_TOKEN")
-
-    if access_token:
-        logger.info("Using DROPBOX_ACCESS_TOKEN for Dropbox client")
-        return dropbox.Dropbox(access_token)
-
-    # Else try refresh token flow (recommended)
-    if isinstance(st.secrets, dict) and "DROPBOX_REFRESH_TOKEN" in st.secrets:
-        refresh_token = st.secrets["DROPBOX_REFRESH_TOKEN"]
-        app_key = st.secrets.get("DROPBOX_APP_KEY") or os.environ.get("DROPBOX_APP_KEY")
-        app_secret = st.secrets.get("DROPBOX_APP_SECRET") or os.environ.get("DROPBOX_APP_SECRET")
-    else:
-        refresh_token = os.environ.get("DROPBOX_REFRESH_TOKEN")
-        app_key = os.environ.get("DROPBOX_APP_KEY")
-        app_secret = os.environ.get("DROPBOX_APP_SECRET")
+    # Prefer st.secrets then environment
+    secrets = st.secrets if isinstance(st.secrets, dict) else {}
+    refresh_token = secrets.get("DROPBOX_REFRESH_TOKEN") or os.environ.get("DROPBOX_REFRESH_TOKEN")
+    app_key = secrets.get("DROPBOX_APP_KEY") or os.environ.get("DROPBOX_APP_KEY")
+    app_secret = secrets.get("DROPBOX_APP_SECRET") or os.environ.get("DROPBOX_APP_SECRET")
+    access_token = secrets.get("DROPBOX_ACCESS_TOKEN") or os.environ.get("DROPBOX_ACCESS_TOKEN")
 
     if refresh_token and app_key and app_secret:
-        # Use Dropbox OAuth2 refresh token to obtain an access token
-        try:
-            from dropbox.oauth import DropboxOAuth2FlowNoRedirect, OAuth2FlowNoRedirect
-            # The official dropbox SDK has DropboxOAuth2FlowNoRedirect for manual flow,
-            # but for server-to-server refresh token exchange we can call token endpoint:
-            import requests
-            token_url = "https://api.dropbox.com/oauth2/token"
-            data = {
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": app_key,
-                "client_secret": app_secret
-            }
-            resp = requests.post(token_url, data=data, timeout=15)
-            if resp.status_code == 200:
-                token_json = resp.json()
-                access_token = token_json.get("access_token")
-                if access_token:
-                    logger.info("Obtained access token from Dropbox refresh token.")
-                    return dropbox.Dropbox(access_token)
-                else:
-                    raise RuntimeError("Failed to exchange refresh token for access token: no access_token in response.")
-            else:
-                logger.error(f"Dropbox token exchange failed: {resp.status_code} - {resp.text}")
-                raise RuntimeError(f"Dropbox token exchange failed: {resp.status_code} - {resp.text}")
-        except Exception as e:
-            logger.error(f"Dropbox auth via refresh token failed: {e}")
-            raise RuntimeError(f"Dropbox auth via refresh token failed: {e}")
+        # Use refresh-token flow (recommended)
+        logger.info("Dropbox: using refresh-token auth from secrets/env")
+        return dropbox.Dropbox(oauth2_refresh_token=refresh_token, app_key=app_key, app_secret=app_secret)
+    elif access_token:
+        logger.info("Dropbox: using plain access token (dev/test mode)")
+        return dropbox.Dropbox(access_token)
+    else:
+        raise RuntimeError("Dropbox credentials not found in st.secrets or environment. Provide DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET (recommended) or DROPBOX_ACCESS_TOKEN for testing.")
 
-    raise RuntimeError("Dropbox credentials not found in st.secrets or environment. Provide DROPBOX_REFRESH_TOKEN + DROPBOX_APP_KEY + DROPBOX_APP_SECRET (recommended) or DROPBOX_ACCESS_TOKEN for testing.")
-
-def upload_to_dropbox(file) -> str:
+def upload_to_dropbox(file):
     """Upload file to Dropbox and return a shareable link (direct download)."""
     if not file:
         return ""
     try:
-        dbx = _get_dropbox_client()
+        dbx = _get_dropbox_client_from_secrets()
 
-        # ensure filename is safe (could add more sanitation)
+        # ensure filename is safe
         filename = file.name
-        # Use app folder root path; if app has App Folder permission it's contained.
         dropbox_path = f"/{filename}"
-        dbx.files_upload(file.getvalue(), dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
 
-        # Create shared link (if exists, API will return existing)
+        content = file.getvalue()
+        dbx.files_upload(content, dropbox_path, mode=dropbox.files.WriteMode("overwrite"))
+
         try:
             res = dbx.sharing_create_shared_link_with_settings(dropbox_path)
             link = res.url
-        except dropbox.exceptions.ApiError as e:
-            # if link already exists, get it
-            try:
-                links = dbx.sharing_list_shared_links(path=dropbox_path, direct_only=True).links
-                if links:
-                    link = links[0].url
-                else:
-                    raise
-            except Exception:
+        except dropbox.exceptions.ApiError:
+            links_res = dbx.sharing_list_shared_links(path=dropbox_path, direct_only=True)
+            links = links_res.links
+            if links:
+                link = links[0].url
+            else:
                 raise
 
-        # Convert to direct-download
         if link.endswith("?dl=0"):
             link = link.replace("?dl=0", "?dl=1")
         elif "?dl=1" not in link:
@@ -311,184 +269,6 @@ def upload_to_dropbox(file) -> str:
     except Exception as e:
         logger.error(f"Dropbox upload failed: {e}")
         raise RuntimeError(f"Dropbox upload failed: {e}")
-
-# ----------------------------
-# Helper: header-aware append logic for Google Sheet
-# ----------------------------
-def _normalize_header(h: str) -> str:
-    return str(h).strip().lower()
-
-def _find_col_index_by_alias(headers: List[str], aliases: List[str]) -> Optional[int]:
-    """
-    Return zero-based index in headers that matches any alias (case-insensitive)
-    """
-    normalized_headers = [h.strip().lower() for h in headers]
-    for alias in aliases:
-        la = alias.strip().lower()
-        for idx, h in enumerate(normalized_headers):
-            if la == h:
-                return idx
-    # fuzzy containment: alias appears in header or header appears in alias
-    for alias in aliases:
-        la = alias.strip().lower()
-        for idx,h in enumerate(normalized_headers):
-            if la in h or h in la:
-                return idx
-    return None
-
-def append_complaint_row(row: List):
-    """
-    Legacy append by list order (keeps compatibility).
-    Use append_complaint_row_by_headers for robust header-aware writes.
-    """
-    if client is None:
-        raise RuntimeError("Google credentials not configured. Cannot append complaint.")
-    comp_ss = client.open(COMPLAINT_SPREADSHEET_NAME)
-    comp_ws = comp_ss.worksheet(COMPLAINT_TAB_NAME)
-    comp_ws.append_row(row)
-
-def append_complaint_row_by_headers(row_dict: Dict[str, object]):
-    """
-    Append using a dict keyed by logical header names.
-    This maps your keys to the sheet headers (case-insensitive, supports aliases),
-    and appends a row with the same number of columns as the sheet header row,
-    writing values into the correct positions.
-    """
-    if client is None:
-        raise RuntimeError("Google credentials not configured. Cannot append complaint by headers.")
-    comp_ss = client.open(COMPLAINT_SPREADSHEET_NAME)
-    comp_ws = comp_ss.worksheet(COMPLAINT_TAB_NAME)
-
-    # Read header row (first non-empty row)
-    try:
-        headers = comp_ws.row_values(1)
-    except Exception as e:
-        logger.error(f"Failed to read header row from sheet: {e}")
-        raise
-
-    if not headers:
-        # If sheet is empty, create header row from keys in row_dict
-        headers = list(row_dict.keys())
-        try:
-            comp_ws.append_row(headers)
-        except Exception as e:
-            logger.error(f"Failed to create header row: {e}")
-            raise
-
-    # Prepare canonical mapping for common aliases
-    # keys we expect in row_dict will map to header names present in sheet
-    canonical_aliases = {
-        "timestamp": ["timestamp", "time", "created", "created at", "created_on"],
-        "school": ["school", "institution", "organisation", "organization"],
-        "reporter": ["reporter", "reporter name", "name"],
-        "category": ["category", "issue", "type", "issue category"],
-        "severity": ["severity", "priority", "priority level"],
-        "product": ["product"],
-        "description": ["description", "details", "issue description", "complaint"],
-        "status": ["status", "ticket status", "state"],
-        "attachment_link": ["attachment link", "attachment", "file link", "file", "attachment_url", "attachment url", "attachmentlink"],
-    }
-
-    # Build reverse map of header -> index
-    header_to_index = {h.strip(): idx for idx, h in enumerate(headers)}
-    # Lowercased list for fuzzy matching
-    normalized_headers = [h.strip().lower() for h in headers]
-
-    # Create target_row with same length as headers, default empty strings
-    target_row = [""] * len(headers)
-
-    # Helper to try mapping a single key to a header index
-    def map_key_to_index(key_name: str, suggested_aliases: Optional[List[str]] = None) -> Optional[int]:
-        # 1) exact header match (case-insensitive)
-        key_lower = key_name.strip().lower()
-        for idx, h in enumerate(normalized_headers):
-            if key_lower == h:
-                return idx
-        # 2) try suggested aliases
-        if suggested_aliases:
-            found = _find_col_index_by_alias(headers, suggested_aliases)
-            if found is not None:
-                return found
-        # 3) try direct alias equalities (key -> header)
-        found = _find_col_index_by_alias(headers, [key_name])
-        if found is not None:
-            return found
-        # 4) fallback: try to find header that contains key words
-        for idx, h in enumerate(normalized_headers):
-            if key_lower in h or h in key_lower:
-                return idx
-        return None
-
-    # Map each provided key in row_dict into the correct index
-    for key, value in row_dict.items():
-        # normalize known key names to canonical_aliases if possible
-        lowkey = key.strip().lower()
-        mapped_idx = None
-        # Try canonical alias sets
-        for canon, aliases in canonical_aliases.items():
-            if lowkey == canon or lowkey in aliases or lowkey.replace(" ", "") == canon:
-                mapped_idx = _find_col_index_by_alias(headers, aliases)
-                if mapped_idx is not None:
-                    break
-        # If not found yet, try map_key_to_index with the key itself
-        if mapped_idx is None:
-            mapped_idx = map_key_to_index(key, suggested_aliases=None)
-        # If mapped, set value
-        if mapped_idx is not None and 0 <= mapped_idx < len(target_row):
-            target_row[mapped_idx] = "" if value is None else str(value)
-        else:
-            # If key couldn't be mapped, we will try to append it at the end
-            # But to preserve column positions, prefer to log and ignore if ambiguous
-            logger.info(f"Could not map key '{key}' to an existing header. It will be ignored: current headers={headers}")
-
-    # Ensure 'Status' column gets value "Open" if not provided
-    # find status column index using aliases
-    status_idx = _find_col_index_by_alias(headers, canonical_aliases["status"])
-    if status_idx is not None:
-        if not target_row[status_idx]:
-            target_row[status_idx] = "Open"
-
-    # Ensure attachment link column exists - try to map; if not present, append a new header
-    attachment_idx = _find_col_index_by_alias(headers, canonical_aliases["attachment_link"])
-    if attachment_idx is None:
-        # Add a new column at the end named "Attachment Link" to the sheet
-        headers.append("Attachment Link")
-        target_row.append("")  # extend target row
-        attachment_idx = len(headers) - 1
-        try:
-            # Update header row (overwrite first row)
-            comp_ws.update("A1:" + gspread.utils.rowcol_to_a1(1, len(headers)), [headers])
-        except Exception as e:
-            logger.error(f"Failed to add 'Attachment Link' header to sheet: {e}")
-            raise RuntimeError(f"Failed to add 'Attachment Link' header to sheet: {e}")
-
-    # If user provided Attachment Link under various keys, ensure it's placed
-    # Check variants in row_dict
-    possible_attachment_keys = ["Attachment Link", "attachment link", "Attachment", "attachment", "File Link", "file link", "file", "attachment_url", "attachment url"]
-    for k in possible_attachment_keys:
-        if k in row_dict and row_dict[k]:
-            target_row[attachment_idx] = str(row_dict[k])
-            break
-    # As fallback, check keys that when lowercased match alias
-    if not target_row[attachment_idx]:
-        for k, v in row_dict.items():
-            if v is None:
-                continue
-            if k.strip().lower() in [x.strip().lower() for x in possible_attachment_keys]:
-                target_row[attachment_idx] = str(v)
-                break
-
-    # Write the row
-    try:
-        comp_ws.append_row(target_row)
-    except Exception as e:
-        logger.error(f"Failed to append row to sheet: {e}")
-        # As fallback, try to append just the raw values
-        try:
-            comp_ws.append_row(list(row_dict.values()))
-        except Exception as ex:
-            logger.error(f"Fallback append also failed: {ex}")
-            raise RuntimeError(f"Append to sheet failed: {e} / {ex}")
 
 # ----------------------------
 # EMAIL HELPER
@@ -568,9 +348,125 @@ def load_school_names():
     schools = [r[school_col_idx].strip() for r in rows if len(r) > school_col_idx and r[school_col_idx].strip()]
     return list(dict.fromkeys(schools))  # unique
 
-def append_complaint_row_legacy(row):
-    # keep for compatibility with earlier code paths that call append_complaint_row
-    append_complaint_row(row)
+def _find_header_index(headers, candidates):
+    """
+    Return index in headers for the first candidate that matches (case-insensitive contains).
+    headers: list of header strings
+    candidates: list of variants e.g. ["File link", "Attachment Link"]
+    returns index or None
+    """
+    if not headers:
+        return None
+    lower_headers = [str(h).lower() for h in headers]
+    for cand in candidates:
+        cand_l = cand.lower()
+        for i, h in enumerate(lower_headers):
+            if cand_l == h or cand_l in h or h in cand_l:
+                return i
+    return None
+
+def append_complaint_row_dict(row_dict):
+    """
+    Append a complaint row to the spreadsheet by matching header names.
+    row_dict: dict mapping logical field names to values. Expected logical names:
+      - timestamp, school, reporter, category, severity, product, description, status, tat, file_link
+    The sheet's header row is inspected; values are placed into matching columns.
+    Any headers not found are left blank. If sheet has extra columns, those are preserved.
+    If sheet is shorter than mapping, extra values are appended at the end.
+    """
+    if client is None:
+        raise RuntimeError("Google credentials not configured. Cannot append complaint.")
+    comp_ss = client.open(COMPLAINT_SPREADSHEET_NAME)
+    comp_ws = comp_ss.worksheet(COMPLAINT_TAB_NAME)
+
+    # read header row
+    headers = comp_ws.row_values(1)
+    num_cols = max(1, len(headers))
+
+    # prepare output row with blanks
+    out_row = [""] * num_cols
+
+    # mapping of logical names -> list of header candidate strings (common variants)
+    mapping = {
+        "timestamp": ["timestamp", "time", "created", "created at"],
+        "school": ["school", "institution", "organisation", "organization"],
+        "reporter": ["reporter", "reporter name", "name"],
+        "category": ["category", "issue", "type"],
+        "severity": ["priority", "severity"],
+        "product": ["product", "prod"],
+        "description": ["description", "details", "issue description", "comment"],
+        "status": ["status"],
+        "tat": ["tat", "turnaround time", "turnaround", "tat (hrs)"],
+        "file_link": ["file link", "attachment link", "attachment", "file", "attachment_url", "attachment link (direct)"]
+    }
+
+    # helper to set value into out_row at header match index
+    def set_for_logical(key, value):
+        nonlocal out_row, headers
+        candidates = mapping.get(key, [key])
+        idx = _find_header_index(headers, candidates)
+        if idx is not None and idx < len(out_row):
+            out_row[idx] = value
+            return True
+        return False
+
+    # set values based on row_dict logical keys
+    # Attempt to use provided keys in logical names as well as permissive matching
+    # Use lowercased keys for matching
+    val_map = {}
+    for k, v in row_dict.items():
+        val_map[k.lower()] = v
+
+    # set each logical field
+    set_for_logical("timestamp", val_map.get("timestamp") or val_map.get("time") or val_map.get("created") or "")
+    set_for_logical("school", val_map.get("school") or "")
+    set_for_logical("reporter", val_map.get("reporter") or val_map.get("reporter name") or "")
+    set_for_logical("category", val_map.get("category") or val_map.get("issue") or "")
+    set_for_logical("severity", val_map.get("severity") or val_map.get("priority") or "")
+    set_for_logical("product", val_map.get("product") or "")
+    set_for_logical("description", val_map.get("description") or val_map.get("details") or "")
+    set_for_logical("status", val_map.get("status") or "Open")
+    # TAT may be intentionally empty
+    set_for_logical("tat", val_map.get("tat") or "")
+
+    # file link should go to 'File link' or 'Attachment Link' if present; otherwise end of row
+    file_val = val_map.get("file_link") or val_map.get("attachment") or val_map.get("attachment link") or ""
+    set_ok = set_for_logical("file_link", file_val)
+    if not set_ok:
+        # no header found for file_link: append to end of out_row
+        out_row.append(file_val)
+
+    # If the sheet has fewer columns in header but there are extra mandatory fields, ensure all values are placed:
+    # If any of the logical fields were not placed because header shorter, append them in a stable order
+    # Identify which logical fields weren't matched (by checking if any header candidate exists)
+    # We already appended file if missing; others are less critical but we handle timestamp if missing
+    # If timestamp header didn't exist, ensure timestamp is at start
+    ts_idx = _find_header_index(headers, mapping["timestamp"])
+    if ts_idx is None:
+        # ensure timestamp at start
+        ts_val = val_map.get("timestamp") or get_ist_timestamp()
+        out_row.insert(0, ts_val)
+
+    # Append the row to the sheet
+    comp_ws.append_row(out_row)
+
+def append_complaint_row(row):
+    """
+    Backwards-compatible helper: accepts a list or dict.
+    If list -> append directly (legacy).
+    If dict -> use append_complaint_row_dict to place values into appropriate columns.
+    """
+    if isinstance(row, dict):
+        append_complaint_row_dict(row)
+    elif isinstance(row, (list, tuple)):
+        # legacy: append list directly
+        if client is None:
+            raise RuntimeError("Google credentials not configured. Cannot append complaint.")
+        comp_ss = client.open(COMPLAINT_SPREADSHEET_NAME)
+        comp_ws = comp_ss.worksheet(COMPLAINT_TAB_NAME)
+        comp_ws.append_row(list(row))
+    else:
+        raise ValueError("append_complaint_row expects a list or dict")
 
 def get_ist_timestamp():
     tz = pytz.timezone("Asia/Kolkata")
@@ -682,7 +578,7 @@ def build_monthly_report(df_all, year:int, month:int):
     csv_bytes = None
     if not df_month.empty:
         keep_cols = []
-        for c in [ts_col, status_col, cat_col, school_col, severity_col, product_col, closed_ts_col]:  # <-- MODIFIED to include product_col
+        for c in [ts_col, status_col, cat_col, school_col, severity_col, product_col, closed_ts_col]:
             if c:
                 keep_cols.append(c)
         export_df = df_month.copy()
@@ -962,21 +858,21 @@ if selected == "Complaints Dashboard":
                 try:
                     with st.spinner("Processing your complaint..."):
                         file_link = upload_to_dropbox(uploaded_file) if uploaded_file else ""
-                        # Use header-aware dict so values land in correct columns regardless of sheet order
+                        # Build a dict and let append_complaint_row_dict place fields into correct columns,
+                        # ensuring the file link goes into "File link" / "Attachment Link" / "Attachment" if present.
                         row_dict = {
-                            "Timestamp": get_ist_timestamp(),
-                            "School": school,
-                            "Reporter": reporter,
-                            "Category": category,
-                            "Severity": severity,
-                            "Product": product,
-                            "Description": description,
-                            # Ensure Status is explicitly set to Open (will be placed into Status column)
-                            "Status": "Open",
-                            # Put the file link under Attachment Link key (sheet mapping will place it correctly)
-                            "Attachment Link": file_link
+                            "timestamp": get_ist_timestamp(),
+                            "school": school,
+                            "reporter": reporter,
+                            "category": category,
+                            "severity": severity,
+                            "product": product,
+                            "description": description,
+                            "status": "Open",
+                            "tat": "",  # intentionally blank; sheet TAT column (if present) will remain blank
+                            "file_link": file_link
                         }
-                        append_complaint_row_by_headers(row_dict)
+                        append_complaint_row(row_dict)
                     st.success("✅ **Complaint Submitted Successfully!**")
                     st.info("📧 You will receive a confirmation email shortly with your complaint details and reference number.")
                     reporter_email = get_reporter_email(reporter)
@@ -1018,14 +914,15 @@ Customer Success Team
             if df_recent.empty:
                 st.info(f"ℹ️ No complaints with status '{status_filter}'.")
             else:
-                # If Attachment Link present, make a clickable view label
-                if "Attachment Link" in df_recent.columns:
-                    df_recent["Attachment Link"] = df_recent["Attachment Link"].apply(lambda x: f"[📎 View File]({x})" if x else "")
-                elif "Attachment" in df_recent.columns:
-                    df_recent["Attachment"] = df_recent["Attachment"].apply(lambda x: f"[📎 View File]({x})" if x else "")
-                elif "File Link" in df_recent.columns:
-                    df_recent["File Link"] = df_recent["File Link"].apply(lambda x: f"[📎 View File]({x})" if x else "")
-
+                # Prefer 'File link', but accept 'Attachment Link' or 'Attachment'
+                display_link_col = None
+                for candidate in ["File link", "File Link", "Attachment Link", "Attachment", "Attachment Link"]:
+                    if candidate in df_recent.columns:
+                        display_link_col = candidate
+                        break
+                # if attachment column present normalize and render clickable
+                if display_link_col:
+                    df_recent[display_link_col] = df_recent[display_link_col].apply(lambda x: f"[📎 View File]({x})" if x and str(x).strip() else "")
                 if "Status" in df_recent.columns:
                     color_map = {"open": "🔴 Open", "in progress": "🟠 In Progress", "closed": "🟢 Closed"}
                     df_recent["Status"] = df_recent["Status"].apply(lambda x: color_map.get(str(x).strip().lower(), x))
