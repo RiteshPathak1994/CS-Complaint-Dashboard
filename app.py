@@ -402,7 +402,7 @@ def append_complaint_row_dict(row_dict):
         "description": ["description", "details", "issue description", "comment"],
         "status": ["status"],
         "tat": ["tat", "turnaround time", "turnaround", "tat (hrs)"],
-        "file_link": ["file link", "attachment link", "attachment", "file", "attachment_url", "attachment link (direct)"]
+        "file_link": ["file link", "attachment link", "attachment", "file", "attachment_url", "attachment link (direct)", "attachment link"]
     }
 
     # helper to set value into out_row at header match index
@@ -433,17 +433,23 @@ def append_complaint_row_dict(row_dict):
     set_for_logical("description", val_map.get("description") or val_map.get("details") or "")
     # If a status was provided use it, otherwise default to Open
     provided_status = val_map.get("status") or "Open"
-    # try to set using header match
+    # try to set using header match (this sets status if header exists)
     status_set = set_for_logical("status", provided_status)
-    # ensure status appears in 8th column (index 7) as requested
-    # expand out_row if needed
-    desired_status_index = 7  # position 8 (1-based)
-    if len(out_row) <= desired_status_index:
-        out_row.extend([""] * (desired_status_index - len(out_row) + 1))
-    # If header explicitly had status and we've set it already, we still ensure index 7 has value
-    if not out_row[desired_status_index]:
-        # set the 8th column explicitly to provided_status (or "Open")
-        out_row[desired_status_index] = provided_status
+
+    # --- NEW: ensure we place status into the actual status header index if found ---
+    status_idx = _find_header_index(headers, mapping["status"])
+    if status_idx is not None:
+        # ensure out_row long enough
+        if status_idx >= len(out_row):
+            out_row.extend([""] * (status_idx - len(out_row) + 1))
+        out_row[status_idx] = provided_status
+    else:
+        # ensure status appears in 8th column (index 7) as a fallback
+        desired_status_index = 7  # position 8 (1-based)
+        if len(out_row) <= desired_status_index:
+            out_row.extend([""] * (desired_status_index - len(out_row) + 1))
+        if not out_row[desired_status_index]:
+            out_row[desired_status_index] = provided_status
 
     # TAT may be intentionally empty; set if provided
     set_for_logical("tat", val_map.get("tat") or "")
@@ -451,8 +457,15 @@ def append_complaint_row_dict(row_dict):
     # file link should go to 'File link' or 'Attachment Link' if present; otherwise place into 11th column (index 10)
     file_val = val_map.get("file_link") or val_map.get("attachment") or val_map.get("attachment link") or ""
     file_set = set_for_logical("file_link", file_val)
-    if not file_set:
-        # If header not found for file_link, ensure row has at least 11 columns and set index 10
+
+    # --- NEW: ensure we place file link into actual attachment header index if found ---
+    file_idx = _find_header_index(headers, mapping["file_link"])
+    if file_idx is not None:
+        if file_idx >= len(out_row):
+            out_row.extend([""] * (file_idx - len(out_row) + 1))
+        out_row[file_idx] = file_val
+    else:
+        # fallback to position 11 (index 10)
         desired_file_index = 10  # position 11 (1-based)
         if len(out_row) <= desired_file_index:
             out_row.extend([""] * (desired_file_index - len(out_row) + 1))
