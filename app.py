@@ -462,19 +462,33 @@ def append_complaint_row_dict(row_dict):
     ts_idx = _find_header_index(headers, mapping["timestamp"])
     if ts_idx is None:
         ts_val = val_map.get("timestamp") or get_ist_timestamp()
-        # ensure it's at index 0 (prepend if out_row currently not long enough or index 0 blank)
+        # DON'T insert at front (that shifts indices). Instead set index 0 safely.
         if len(out_row) == 0:
             out_row = [ts_val]
         else:
-            # If index 0 is blank, set it; else insert at front
+            # ensure out_row has at least 1 element and set index 0
+            if len(out_row) < 1:
+                out_row.extend([""] * (1 - len(out_row)))
+            # If index 0 already has something (rare), leave it only if it looks like a timestamp; otherwise overwrite.
+            try_overwrite = False
             if not out_row[0]:
-                out_row[0] = ts_val
+                try_overwrite = True
             else:
-                out_row.insert(0, ts_val)
+                # crude heuristic: if existing value looks nothing like a timestamp, overwrite it with ts_val
+                existing = str(out_row[0])
+                if len(existing.strip()) < 4 or not any(ch.isdigit() for ch in existing):
+                    try_overwrite = True
+            if try_overwrite:
+                out_row[0] = ts_val
+            # otherwise keep whatever's at index 0 (avoid shifting)
 
     # Final safety: ensure out_row length is at least the header count (so append_row uses same number of cols)
     if len(out_row) < num_cols:
         out_row.extend([""] * (num_cols - len(out_row)))
+
+    # Debug: log header vs row lengths and a preview of out_row for troubleshooting
+    logger.info(f"append_complaint_row_dict: headers ({len(headers)}): {headers}")
+    logger.info(f"append_complaint_row_dict: final out_row length {len(out_row)}; preview: {out_row[:min(50, len(out_row))]}")
 
     # Append the row to the sheet
     comp_ws.append_row(out_row)
