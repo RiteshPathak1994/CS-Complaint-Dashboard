@@ -499,12 +499,21 @@ def append_complaint_row_dict(row_dict):
     if len(out_row) < num_cols:
         out_row.extend([""] * (num_cols - len(out_row)))
 
+    # Debug: store headers and out_row in session_state for UI inspection
+    try:
+        st.session_state["_last_append_headers"] = headers
+        st.session_state["_last_out_row"] = out_row
+        st.session_state["_last_provided_status"] = provided_status
+    except Exception:
+        # session_state may not be writable in some contexts; ignore if it fails
+        logger.debug("Failed to set session_state debug keys (non-fatal)")
+
     # Debug: log header vs row lengths and a preview of out_row for troubleshooting
     logger.info(f"append_complaint_row_dict: headers ({len(headers)}): {headers}")
     logger.info(f"append_complaint_row_dict: final out_row length {len(out_row)}; preview: {out_row[:min(50, len(out_row))]}")
 
-    # Append the row to the sheet
-    comp_ws.append_row(out_row)
+    # Append the row to the sheet (use USER_ENTERED to reduce formatting surprises)
+    comp_ws.append_row(out_row, value_input_option="USER_ENTERED")
 
 def append_complaint_row(row):
     """
@@ -520,7 +529,8 @@ def append_complaint_row(row):
             raise RuntimeError("Google credentials not configured. Cannot append complaint.")
         comp_ss = client.open(COMPLAINT_SPREADSHEET_NAME)
         comp_ws = comp_ss.worksheet(COMPLAINT_TAB_NAME)
-        comp_ws.append_row(list(row))
+        # use USER_ENTERED here too
+        comp_ws.append_row(list(row), value_input_option="USER_ENTERED")
     else:
         raise ValueError("append_complaint_row expects a list or dict")
 
@@ -727,6 +737,45 @@ selected = option_menu(
         "nav-link-selected": {"background-color": "#0b5ed7", "color": "white", "font-weight": "600"},
     }
 )
+
+# ----------------------------
+# Debug: sidebar toggle to show last append headers/out_row & live headers
+# ----------------------------
+if "debug_show_append" not in st.session_state:
+    st.session_state["debug_show_append"] = False
+
+with st.sidebar:
+    st.session_state["debug_show_append"] = st.checkbox("Show append debug", value=st.session_state.get("debug_show_append", False))
+    if st.session_state["debug_show_append"]:
+        st.markdown("**Last computed append data (session)**")
+        hdrs = st.session_state.get("_last_append_headers")
+        outrow = st.session_state.get("_last_out_row")
+        prov_status = st.session_state.get("_last_provided_status")
+        if hdrs is not None:
+            st.write("Headers (from last append):", hdrs)
+        else:
+            st.write("Headers (from last append): *none yet*")
+        if outrow is not None:
+            st.write("Last out_row (from last append):", outrow)
+        else:
+            st.write("Last out_row: *none yet*")
+        st.write("Last provided status value:", prov_status if prov_status is not None else "*none*")
+        # Also try to read live headers from the sheet if possible
+        try:
+            if client is not None:
+                comp_ss = client.open(COMPLAINT_SPREADSHEET_NAME)
+                comp_ws = comp_ss.worksheet(COMPLAINT_TAB_NAME)
+                live_hdrs = comp_ws.row_values(1)
+                st.write("Live sheet headers:", live_hdrs)
+            else:
+                st.write("Live sheet headers: gspread client not available")
+        except Exception as e:
+            st.write("Could not fetch live headers:", str(e))
+        st.markdown("---")
+        st.markdown("**If Status is empty after submit, check:**")
+        st.markdown("- That the sheet's header row has a single `Status`-like header (no merged cells, no zero-width chars).")
+        st.markdown("- That there are no formulas in the Status column which might overwrite new values.")
+        st.markdown("- That there are not duplicate `Status` headers (duplicate headers may confuse placement).")
 
 # ----------------------------
 # PAGE 1: COMPLAINT DASHBOARD
