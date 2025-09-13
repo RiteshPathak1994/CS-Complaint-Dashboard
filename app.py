@@ -373,6 +373,10 @@ def append_complaint_row_dict(row_dict):
     The sheet's header row is inspected; values are placed into matching columns.
     Any headers not found are left blank. If sheet has extra columns, those are preserved.
     If sheet is shorter than mapping, extra values are appended at the end.
+
+    Additional behavior:
+      - If the sheet lacks a Status header, the status value will be forced into the 8th column (index 7).
+      - If the sheet lacks a File/Attachment header, the file link will be placed into the 11th column (index 10).
     """
     if client is None:
         raise RuntimeError("Google credentials not configured. Cannot append complaint.")
@@ -383,7 +387,7 @@ def append_complaint_row_dict(row_dict):
     headers = comp_ws.row_values(1)
     num_cols = max(1, len(headers))
 
-    # prepare output row with blanks
+    # prepare output row with blanks (match header length)
     out_row = [""] * num_cols
 
     # mapping of logical names -> list of header candidate strings (common variants)
@@ -405,19 +409,20 @@ def append_complaint_row_dict(row_dict):
         nonlocal out_row, headers
         candidates = mapping.get(key, [key])
         idx = _find_header_index(headers, candidates)
-        if idx is not None and idx < len(out_row):
+        if idx is not None:
+            # ensure out_row is large enough
+            if idx >= len(out_row):
+                out_row.extend([""] * (idx - len(out_row) + 1))
             out_row[idx] = value
-            return True
-        return False
+            return idx
+        return None
 
-    # set values based on row_dict logical keys
-    # Attempt to use provided keys in logical names as well as permissive matching
-    # Use lowercased keys for matching
+    # normalize input keys
     val_map = {}
     for k, v in row_dict.items():
         val_map[k.lower()] = v
 
-    # set each logical field
+    # set each logical field; record indices
     set_for_logical("timestamp", val_map.get("timestamp") or val_map.get("time") or val_map.get("created") or "")
     set_for_logical("school", val_map.get("school") or "")
     set_for_logical("reporter", val_map.get("reporter") or val_map.get("reporter name") or "")
@@ -425,26 +430,37 @@ def append_complaint_row_dict(row_dict):
     set_for_logical("severity", val_map.get("severity") or val_map.get("priority") or "")
     set_for_logical("product", val_map.get("product") or "")
     set_for_logical("description", val_map.get("description") or val_map.get("details") or "")
-    set_for_logical("status", val_map.get("status") or "Open")
-    # TAT may be intentionally empty
+
+    # status: prefer provided, default "Open"
+    status_val = val_map.get("status") or "Open"
+    status_idx = set_for_logical("status", status_val)
+
+    # tat
     set_for_logical("tat", val_map.get("tat") or "")
 
-    # file link should go to 'File link' or 'Attachment Link' if present; otherwise end of row
+    # file link handling
     file_val = val_map.get("file_link") or val_map.get("attachment") or val_map.get("attachment link") or ""
-    set_ok = set_for_logical("file_link", file_val)
-    if not set_ok:
-        # no header found for file_link: append to end of out_row
-        out_row.append(file_val)
+    file_idx = set_for_logical("file_link", file_val)
 
-    # If the sheet has fewer columns in header but there are extra mandatory fields, ensure all values are placed:
-    # If any of the logical fields were not placed because header shorter, append them in a stable order
-    # Identify which logical fields weren't matched (by checking if any header candidate exists)
-    # We already appended file if missing; others are less critical but we handle timestamp if missing
-    # If timestamp header didn't exist, ensure timestamp is at start
+    # If status header missing, ensure status lands in 8th column (index 7)
+    if status_idx is None:
+        desired_status_idx = 7  # 8th column (1-based)
+        if desired_status_idx >= len(out_row):
+            out_row.extend([""] * (desired_status_idx - len(out_row) + 1))
+        out_row[desired_status_idx] = status_val
+
+    # If file link header missing, place it into 11th column (index 10)
+    if file_idx is None:
+        desired_file_idx = 10  # 11th column (1-based)
+        if desired_file_idx >= len(out_row):
+            out_row.extend([""] * (desired_file_idx - len(out_row) + 1))
+        out_row[desired_file_idx] = file_val
+
+    # Ensure timestamp exists at start if header missing (keeps legacy behavior)
     ts_idx = _find_header_index(headers, mapping["timestamp"])
     if ts_idx is None:
-        # ensure timestamp at start
         ts_val = val_map.get("timestamp") or get_ist_timestamp()
+        # insert at position 0
         out_row.insert(0, ts_val)
 
     # Append the row to the sheet
@@ -860,6 +876,7 @@ if selected == "Complaints Dashboard":
                         file_link = upload_to_dropbox(uploaded_file) if uploaded_file else ""
                         # Build a dict and let append_complaint_row_dict place fields into correct columns,
                         # ensuring the file link goes into "File link" / "Attachment Link" / "Attachment" if present.
+                        # Status is forced to "Open" and will be placed in header-matched Status column OR 8th column (index 7).
                         row_dict = {
                             "timestamp": get_ist_timestamp(),
                             "school": school,
