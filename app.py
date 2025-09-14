@@ -384,8 +384,8 @@ def append_complaint_row_dict(row_dict):
     comp_ss = client.open(COMPLAINT_SPREADSHEET_NAME)
     comp_ws = comp_ss.worksheet(COMPLAINT_TAB_NAME)
 
-    # read header row
-    headers = comp_ws.row_values(1)
+    # read header row and strip headers (IMPORTANT: strip to avoid trailing spaces causing mismatches)
+    headers = [h.strip() for h in comp_ws.row_values(1)]
     num_cols = max(1, len(headers))
 
     # prepare output row with blanks
@@ -436,7 +436,7 @@ def append_complaint_row_dict(row_dict):
     # try to set using header match (this sets status if header exists)
     status_set = set_for_logical("status", provided_status)
 
-    # --- NEW: ensure we place status into the actual status header index if found ---
+    # --- Ensure we place status into the actual status header index if found (robust) ---
     status_idx = _find_header_index(headers, mapping["status"])
     if status_idx is not None:
         # ensure out_row long enough
@@ -448,8 +448,8 @@ def append_complaint_row_dict(row_dict):
         desired_status_index = 7  # position 8 (1-based)
         if len(out_row) <= desired_status_index:
             out_row.extend([""] * (desired_status_index - len(out_row) + 1))
-        if not out_row[desired_status_index]:
-            out_row[desired_status_index] = provided_status
+        # Always set fallback status (don't check existing value) to guarantee Open
+        out_row[desired_status_index] = provided_status
 
     # TAT may be intentionally empty; set if provided
     set_for_logical("tat", val_map.get("tat") or "")
@@ -458,7 +458,7 @@ def append_complaint_row_dict(row_dict):
     file_val = val_map.get("file_link") or val_map.get("attachment") or val_map.get("attachment link") or ""
     file_set = set_for_logical("file_link", file_val)
 
-    # --- NEW: ensure we place file link into actual attachment header index if found ---
+    # ensure we place file link into actual attachment header index if found
     file_idx = _find_header_index(headers, mapping["file_link"])
     if file_idx is not None:
         if file_idx >= len(out_row):
@@ -503,8 +503,21 @@ def append_complaint_row_dict(row_dict):
     logger.info(f"append_complaint_row_dict: headers ({len(headers)}): {headers}")
     logger.info(f"append_complaint_row_dict: final out_row length {len(out_row)}; preview: {out_row[:min(50, len(out_row))]}")
 
-    # Append the row to the sheet
-    comp_ws.append_row(out_row)
+    # Append the row to the sheet using USER_ENTERED so Sheets treats it like a user write
+    try:
+        comp_ws.append_row(out_row, value_input_option="USER_ENTERED")
+        logger.info("append_complaint_row_dict: appended row (status forced).")
+        # optional: fetch last row to verify write (logs only)
+        try:
+            all_vals = comp_ws.get_all_values()
+            if all_vals:
+                last_row = all_vals[-1]
+                logger.info(f"append_complaint_row_dict: last sheet row preview: {last_row[:min(50, len(last_row))]}")
+        except Exception as e:
+            logger.warning(f"append_complaint_row_dict: could not fetch last row for verification: {e}")
+    except Exception as e:
+        logger.error(f"append_complaint_row_dict: append failed: {e}")
+        raise
 
 def append_complaint_row(row):
     """
@@ -520,7 +533,7 @@ def append_complaint_row(row):
             raise RuntimeError("Google credentials not configured. Cannot append complaint.")
         comp_ss = client.open(COMPLAINT_SPREADSHEET_NAME)
         comp_ws = comp_ss.worksheet(COMPLAINT_TAB_NAME)
-        comp_ws.append_row(list(row))
+        comp_ws.append_row(list(row), value_input_option="USER_ENTERED")
     else:
         raise ValueError("append_complaint_row expects a list or dict")
 
